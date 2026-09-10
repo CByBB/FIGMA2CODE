@@ -101,6 +101,7 @@ function cloneComponentAsFrame(component: ComponentNode): FrameNode {
   }
 
   for (const child of component.children) {
+    if (child.visible === false) continue;
     const c = cloneSceneNode(child);
     frame.appendChild(c);
     c.x = child.x;

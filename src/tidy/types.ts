@@ -37,11 +37,14 @@ export type WrapperSpec = {
   /** Stable key before the wrapper frame exists; remapped to node id in apply. */
   key: string;
   name: string;
+  /** Direct children of this wrapper (not including nodes owned by nested wrappers). */
   childNodeIds: string[];
   layout: AutoLayoutSpec;
   childSizing: ChildSizingSpec[];
   /** Union bounds in parent space — wrapper frame is placed here before Auto Layout. */
   bounds: Rect;
+  /** Nested tidy wrappers (bounds are local to this wrapper). */
+  wrappers?: WrapperSpec[];
 };
 
 export type FrameTidySpec = {

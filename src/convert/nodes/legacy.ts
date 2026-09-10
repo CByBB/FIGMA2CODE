@@ -93,7 +93,10 @@ export const oldConvertNodesToAltNodes = (
   sceneNode: ReadonlyArray<SceneNode>,
   parent: ParentNode | null,
 ): Array<SceneNode> =>
-  sceneNode.map(convertNodeToAltNode(parent)).filter(isNotEmpty);
+  sceneNode
+    .filter((n) => n.visible !== false)
+    .map(convertNodeToAltNode(parent))
+    .filter(isNotEmpty);
 
 export const cloneNode = <T extends BaseNode>(
   node: T,

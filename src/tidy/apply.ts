@@ -9,9 +9,12 @@ import type {
 import {
   AbsSnap,
   TIDY_WRAPPER_KEY,
+  convertGroupToFrame,
   driftedIds,
+  paintKey,
   placeLocalBox,
   restoreFramePixelPerfect,
+  revertParentAutoLayoutKeepWrappers,
   snapAbs,
   snapTree,
 } from "./preserve";
@@ -81,7 +84,14 @@ function pinFixedSize(node: SceneNode, w: number, h: number): void {
     n.layoutGrow = 0;
     n.layoutAlign = "INHERIT";
     // AABB size ≠ layout size when rotated — resizing to the box grows the node.
-    if ("resize" in n && !isRotatable(n)) {
+    // Zero-width/height lines must not be forced to 1px (that alone fails pixel checks).
+    if (
+      "resize" in n &&
+      !isRotatable(n) &&
+      node.type !== "LINE" &&
+      w >= 0.5 &&
+      h >= 0.5
+    ) {
       (n as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
     }
   } catch (e) {
@@ -135,66 +145,6 @@ function parentAbsOrigin(node: BaseNode | null): { x: number; y: number } {
   return { x: 0, y: 0 };
 }
 
-function convertGroupToFrame(group: GroupNode): FrameNode {
-  const parent = group.parent;
-  if (!parent || !("appendChild" in parent)) {
-    throw new Error(`Group "${group.name}" has no parent`);
-  }
-
-  const index = parent.children.indexOf(group);
-  const groupBox = group.absoluteBoundingBox;
-  const children = [...group.children].map((child) => ({
-    node: child,
-    snap: snapAbs(child),
-  }));
-
-  const frame = figma.createFrame();
-  frame.name = group.name;
-  frame.resizeWithoutConstraints(
-    Math.max(1, groupBox?.width ?? group.width),
-    Math.max(1, groupBox?.height ?? group.height),
-  );
-  const origin = parentAbsOrigin(parent);
-  if (groupBox) {
-    // Group x/y can be transform origin; AABB is the visual box we must keep.
-    frame.x = groupBox.x - origin.x;
-    frame.y = groupBox.y - origin.y;
-  } else {
-    frame.x = group.x;
-    frame.y = group.y;
-  }
-  frame.fills = [];
-  frame.clipsContent = false;
-
-  if ("opacity" in group) frame.opacity = group.opacity;
-  if ("blendMode" in group) frame.blendMode = group.blendMode;
-  if ("isMask" in group) frame.isMask = group.isMask;
-  if ("locked" in group) frame.locked = group.locked;
-  if ("visible" in group) frame.visible = group.visible;
-
-  parent.insertChild(index >= 0 ? index : parent.children.length, frame);
-
-  // appendChild preserves world position (and bakes group rotation into children).
-  // Do not write the pre-reparent x/y — those are not frame-local.
-  for (const { node, snap } of children) {
-    if (!node.parent) continue;
-    try {
-      frame.appendChild(node);
-      if (snap) {
-        const frameAbs = frame.absoluteBoundingBox;
-        if (frameAbs) {
-          placeLocalBox(node, snap.x - frameAbs.x, snap.y - frameAbs.y);
-        }
-      }
-    } catch (e) {
-      logError(`group→frame reparent failed (${safeNodeRef(node)})`, e);
-    }
-  }
-
-  safeRemove(group);
-  return frame;
-}
-
 function unwrapGroup(group: GroupNode): SceneNode {
   const parent = group.parent;
   if (!parent || !("appendChild" in parent) || group.children.length !== 1) {
@@ -231,11 +181,8 @@ async function createWrapperFrame(
 
   const moved: Array<{
     node: SceneNode;
-    lx: number;
-    ly: number;
+    snap: AbsSnap | null;
     index: number;
-    w: number;
-    h: number;
   }> = [];
   for (const id of spec.childNodeIds) {
     const n = await getNode(id);
@@ -243,14 +190,10 @@ async function createWrapperFrame(
     const child = n as SceneNode;
     if (!("x" in child)) continue;
     const index = parent.children.indexOf(child);
-    const snap = before.get(child.id);
     moved.push({
       node: child,
-      lx: (child as LayoutMixin).x - spec.bounds.x,
-      ly: (child as LayoutMixin).y - spec.bounds.y,
+      snap: before.get(child.id) ?? snapAbs(child),
       index: index >= 0 ? index : parent.children.length,
-      w: snap?.w ?? (child as LayoutMixin).width,
-      h: snap?.h ?? (child as LayoutMixin).height,
     });
   }
 
@@ -261,16 +204,32 @@ async function createWrapperFrame(
 
   parent.insertChild(insertAt, frame);
 
-  for (const { node, lx, ly, w, h } of moved) {
-    frame.appendChild(node);
-    if ("x" in node) {
-      (node as LayoutMixin).x = lx;
-      (node as LayoutMixin).y = ly;
+  // Append in original paint order so backgrounds stay under text (not LTR sort).
+  moved.sort((a, b) => paintKey(a.node) - paintKey(b.node));
+
+  const placeMoved = () => {
+    const fa = frame.absoluteBoundingBox;
+    for (const { node, snap } of moved) {
+      if (!snap || !fa) continue;
+      placeLocalBox(node, snap.x - fa.x, snap.y - fa.y, snap.w, snap.h);
+      pinFixedSize(node, snap.w, snap.h);
     }
-    pinFixedSize(node, w, h);
+  };
+
+  for (const { node } of moved) {
+    frame.appendChild(node);
+  }
+  placeMoved();
+
+  // Nested wrappers (row/col inside a canyon column) — bounds are local to `frame`.
+  for (const nested of spec.wrappers ?? []) {
+    await createWrapperFrame(frame, nested, before);
   }
 
-  // Apply layout only after children are pinned — still re-pin afterward because AL can nudge sizes.
+  // Positions after grouping, before this wrapper's Auto Layout.
+  const midWrap = snapTree(frame);
+
+  // Try Auto Layout; if it shifts pixels, keep the group frame with freeform children.
   applyAutoLayout(frame, {
     ...spec.layout,
     primaryAxisAlignItems: "MIN",
@@ -282,9 +241,30 @@ async function createWrapperFrame(
     Math.max(1, spec.bounds.width),
     Math.max(1, spec.bounds.height),
   );
+  for (const { node, snap } of moved) {
+    if (snap) pinFixedSize(node, snap.w, snap.h);
+  }
 
-  for (const { node, w, h } of moved) {
-    pinFixedSize(node, w, h);
+  const bad = driftedIds(frame, before);
+  if (bad.length > 0) {
+    try {
+      frame.layoutMode = "NONE";
+    } catch (e) {
+      logError(`wrapper layoutMode NONE failed (${safeNodeRef(frame)})`, e);
+    }
+    frame.resizeWithoutConstraints(
+      Math.max(1, spec.bounds.width),
+      Math.max(1, spec.bounds.height),
+    );
+    frame.x = spec.bounds.x;
+    frame.y = spec.bounds.y;
+    const fa = frame.absoluteBoundingBox;
+    for (const child of [...frame.children] as SceneNode[]) {
+      const s = midWrap.get(child.id);
+      if (s && fa) {
+        placeLocalBox(child, s.x - fa.x, s.y - fa.y, s.w, s.h);
+      }
+    }
   }
 
   return frame;
@@ -308,6 +288,17 @@ async function applyFrameSpec(
   try {
     for (const wrapper of spec.wrappers) {
       await createWrapperFrame(frame, wrapper, before);
+    }
+
+    // Snapshot after nested wrappers exist — used if parent AL must roll back alone.
+    const mid = snapTree(frame);
+    const wrapDrift = driftedIds(frame, before);
+    if (wrapDrift.length > 0) {
+      tidyWarn(
+        `Reverted wrappers on "${frame.name}" — would shift ${wrapDrift.length} layer(s)`,
+      );
+      restoreFramePixelPerfect(frame, before);
+      return;
     }
 
     const bgId = spec.foldBackgroundId || spec.stretchBackgroundId;
@@ -444,12 +435,26 @@ async function applyFrameSpec(
     }
 
     // Revert this frame if any descendant moved — convert must see identical pixels.
+    // Prefer keeping successful nested wrappers when only the parent stack drifts.
     const bad = driftedIds(frame, before);
     if (bad.length > 0) {
-      tidyWarn(
-        `Reverted Auto Layout on "${frame.name}" — would shift ${bad.length} layer(s)`,
-      );
-      restoreFramePixelPerfect(frame, before);
+      if (spec.wrappers.length > 0) {
+        tidyWarn(
+          `Kept nested wrappers on "${frame.name}" — parent Auto Layout reverted (${bad.length} layer(s))`,
+        );
+        revertParentAutoLayoutKeepWrappers(frame, mid);
+        if (driftedIds(frame, before).length > 0) {
+          tidyWarn(
+            `Reverted Auto Layout on "${frame.name}" — would shift ${bad.length} layer(s)`,
+          );
+          restoreFramePixelPerfect(frame, before);
+        }
+      } else {
+        tidyWarn(
+          `Reverted Auto Layout on "${frame.name}" — would shift ${bad.length} layer(s)`,
+        );
+        restoreFramePixelPerfect(frame, before);
+      }
     }
   } finally {
     if (wasLocked) frame.locked = true;
@@ -488,6 +493,16 @@ export async function applyTidyPlan(
 
   const mapId = (id: string) => idRemap.get(id) ?? id;
 
+  const remapWrapper = (wrapper: WrapperSpec) => {
+    wrapper.childNodeIds = wrapper.childNodeIds.map(mapId);
+    for (const sizing of wrapper.childSizing) {
+      sizing.nodeId = mapId(sizing.nodeId);
+    }
+    for (const nested of wrapper.wrappers ?? []) {
+      remapWrapper(nested);
+    }
+  };
+
   for (const spec of plan.frames) {
     spec.nodeId = mapId(spec.nodeId);
     if (spec.foldBackgroundId) {
@@ -503,10 +518,7 @@ export async function applyTidyPlan(
       sizing.nodeId = mapId(sizing.nodeId);
     }
     for (const wrapper of spec.wrappers) {
-      wrapper.childNodeIds = wrapper.childNodeIds.map(mapId);
-      for (const sizing of wrapper.childSizing) {
-        sizing.nodeId = mapId(sizing.nodeId);
-      }
+      remapWrapper(wrapper);
     }
   }
 

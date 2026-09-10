@@ -77,6 +77,20 @@ export function coversParent(
   return (coverW * coverH) / (parent.width * parent.height) >= ratio;
 }
 
+/** True when `inner` has no overlap with `outer` (fully clipped away). */
+export function isEntirelyOutside(
+  inner: Rect,
+  outer: Rect,
+  eps = 0.5,
+): boolean {
+  return (
+    rectRight(inner) <= outer.x + eps ||
+    rectBottom(inner) <= outer.y + eps ||
+    inner.x >= rectRight(outer) - eps ||
+    inner.y >= rectBottom(outer) - eps
+  );
+}
+
 export function containsPoint(r: Rect, px: number, py: number): boolean {
   return px >= r.x && px <= rectRight(r) && py >= r.y && py <= rectBottom(r);
 }
@@ -295,4 +309,100 @@ export function unionRect(rects: Rect[]): Rect | null {
     maxY = Math.max(maxY, rectBottom(r));
   }
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+/**
+ * Cluster items by a canyon on X (HORIZONTAL) or Y (VERTICAL): merge overlapping
+ * projections, then split where the gap between clusters is ≥ minGap.
+ */
+export function clusterByGap(
+  items: ChildGeom[],
+  axis: "HORIZONTAL" | "VERTICAL",
+  minGap: number,
+): ChildGeom[][] {
+  if (items.length === 0) return [];
+  const intervals = items
+    .map((it) => {
+      const start = axis === "HORIZONTAL" ? it.rect.x : it.rect.y;
+      const end =
+        axis === "HORIZONTAL" ? rectRight(it.rect) : rectBottom(it.rect);
+      return { it, start, end };
+    })
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+
+  const clusters: ChildGeom[][] = [];
+  let cur = [intervals[0]];
+  let curEnd = intervals[0].end;
+  for (let i = 1; i < intervals.length; i++) {
+    const gap = intervals[i].start - curEnd;
+    if (gap >= minGap) {
+      clusters.push(cur.map((x) => x.it));
+      cur = [intervals[i]];
+      curEnd = intervals[i].end;
+    } else {
+      cur.push(intervals[i]);
+      curEnd = Math.max(curEnd, intervals[i].end);
+    }
+  }
+  clusters.push(cur.map((x) => x.it));
+  return clusters;
+}
+
+/**
+ * Find a major left/right or top/bottom split (e.g. text column | photo).
+ * Uses the largest clear canyon between overlap-merged groups — not a threshold
+ * scaled by median item size (a wide photo would inflate that past the real gap).
+ */
+export function majorGapClusters(
+  items: ChildGeom[],
+  axis: "HORIZONTAL" | "VERTICAL",
+): ChildGeom[][] | null {
+  if (items.length < 3) return null;
+
+  // Merge only overlapping/touching projections so we can measure true canyons.
+  const touching = clusterByGap(items, axis, ALIGN_EPS);
+  if (touching.length < 2) return null;
+
+  type Gap = { after: number; gap: number };
+  const gaps: Gap[] = [];
+  for (let i = 0; i < touching.length - 1; i++) {
+    const left = touching[i];
+    const right = touching[i + 1];
+    const leftEnd = Math.max(
+      ...left.map((it) =>
+        axis === "HORIZONTAL" ? rectRight(it.rect) : rectBottom(it.rect),
+      ),
+    );
+    const rightStart = Math.min(
+      ...right.map((it) => (axis === "HORIZONTAL" ? it.rect.x : it.rect.y)),
+    );
+    gaps.push({ after: i, gap: rightStart - leftEnd });
+  }
+
+  const positive = gaps.filter((g) => g.gap >= 24);
+  if (positive.length === 0) return null;
+
+  positive.sort((a, b) => b.gap - a.gap);
+  const best = positive[0];
+  const otherMed =
+    positive.length > 1 ? median(positive.slice(1).map((g) => g.gap)) : 0;
+  // Require a dominant canyon (clearly larger than other gaps, or simply wide).
+  if (best.gap < 40 && !(best.gap >= 32 && best.gap >= otherMed * 1.75)) {
+    return null;
+  }
+  if (positive.length > 1 && best.gap < otherMed * 1.4 && best.gap < 64) {
+    return null;
+  }
+
+  const left = touching.slice(0, best.after + 1).flat();
+  const right = touching.slice(best.after + 1).flat();
+  if (left.length === 0 || right.length === 0) return null;
+
+  // Both sides need real content — avoid splitting off a lone decoration.
+  const leftArea = left.reduce((s, it) => s + rectArea(it.rect), 0);
+  const rightArea = right.reduce((s, it) => s + rectArea(it.rect), 0);
+  if (leftArea < 100 || rightArea < 100) return null;
+  if (left.length === 1 && right.length === 1) return null;
+
+  return [left, right];
 }

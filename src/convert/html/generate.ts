@@ -83,6 +83,11 @@ const htmlWidgetGenerator = async (
 };
 
 const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
+  // Hidden layers are never worth emitting — skip before SVG/cache work.
+  if (node.visible === false) {
+    return "";
+  }
+
   // Prefer baked SVG from ZIP cache (gradient text, icon instances, effect-heavy vectors).
   const cachedSvg = node.id ? getCachedAsset(node.id) : undefined;
   if (

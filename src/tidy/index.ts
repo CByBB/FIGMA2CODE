@@ -6,13 +6,19 @@ import { logError } from "../shared/log";
 import { applyTidyPlan } from "./apply";
 import { createTidyClone } from "./clone";
 import { buildTidyPlan } from "./infer";
+import { fixCoveringPaintOrder, stampPaintOrder } from "./preserve";
 import { resolveTidyTarget } from "./target";
 import { clearTidyWarnings, takeTidyWarnings, tidyWarn } from "./warnings";
 import { buildLayerInventory } from "./ai/inventory";
 import { getOpenRouterApiKey } from "./ai/key";
 import { callOpenRouterVision, OpenRouterHttpError } from "./ai/openrouter";
 import { captureRootScreenshot } from "./ai/screenshot";
-import { applyAiSections, ensurePageVerticalFlow } from "./ai/sections";
+import {
+  applyAiSections,
+  ensurePageVerticalFlow,
+  liftOverflowDecorations,
+} from "./ai/sections";
+import { pruneNonVisibleNodes } from "./prune";
 import { repairOverlappingPageSections, repairTreeContainment } from "./repair";
 
 let tidying = false;
@@ -52,6 +58,12 @@ export async function tidySelection(): Promise<SceneNode | null> {
     const target = resolveTidyTarget();
     const cloned = await createTidyClone(target);
     root = cloned.root;
+
+    // Drop hidden layers and nodes fully outside a clipping root before vision/AL.
+    pruneNonVisibleNodes(root);
+
+    // Capture source paint order before reparent/wrap so z-order can be restored.
+    stampPaintOrder(root);
 
     const rw = "width" in root ? root.width : 0;
     const rh = "height" in root ? root.height : 0;
@@ -134,10 +146,18 @@ export async function tidySelection(): Promise<SceneNode | null> {
       const plan = buildTidyPlan(root);
       await applyTidyPlan(plan, root);
 
+      // Wrappers often pull text into a row while card fills stay as later siblings
+      // and paint on top — reinsert covers into the host at original z-order.
+      fixCoveringPaintOrder(root);
+      // Do NOT globally reorder all siblings (restoreSiblingPaintOrder) — that can
+      // surface layers designers intentionally kept covered / clipped.
+
       // Apply can roll back nested frames; re-assert page vertical flow last.
       if (root.type === "FRAME") {
         repairOverlappingPageSections(root);
+        liftOverflowDecorations(root as FrameNode);
         ensurePageVerticalFlow(root as FrameNode);
+        // Keep the clone's original clipsContent — forcing false reveals hidden overflow.
       }
     }
 

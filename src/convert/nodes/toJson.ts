@@ -254,7 +254,8 @@ const processNodePair = async (
   parentCumulativeRotation: number = 0,
 ): Promise<RestAltNode | RestAltNode[] | null> => {
   if (!jsonNode.id) return null;
-  if (jsonNode.visible === false) return null;
+  // Prefer live visibility: REST sometimes omits `visible`, and tidy may disagree with JSON.
+  if (jsonNode.visible === false || figmaNode.visible === false) return null;
 
   const nodeType = jsonNode.type;
 

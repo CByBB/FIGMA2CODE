@@ -4,6 +4,10 @@ import { logError, safeNodeRef } from "../shared/log";
 
 export const PIXEL_EPS = 0.5;
 export const TIDY_WRAPPER_KEY = "tidyWrapper";
+/** Original document paint order (DFS index) — used to restore z-order after reparent. */
+export const TIDY_PAINT_KEY = "tidyPaint";
+/** Page-absolute decoration lifted for vertical cross-section bleed. */
+export const TIDY_LIFTED_KEY = "tidyLifted";
 
 export type AbsSnap = {
   x: number;
@@ -134,7 +138,10 @@ export function placeLocalBox(
     !rotated &&
     typeof w === "number" &&
     typeof h === "number" &&
-    "resize" in node
+    "resize" in node &&
+    node.type !== "LINE" &&
+    w >= 0.5 &&
+    h >= 0.5
   ) {
     try {
       (node as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
@@ -149,6 +156,84 @@ export function placeLocalBox(
   } catch (e) {
     logError(`absolute box write failed (${safeNodeRef(node)})`, e);
   }
+}
+
+function parentAbsOrigin(parent: BaseNode & ChildrenMixin): {
+  x: number;
+  y: number;
+} {
+  if ("absoluteBoundingBox" in parent && parent.absoluteBoundingBox) {
+    return {
+      x: parent.absoluteBoundingBox.x,
+      y: parent.absoluteBoundingBox.y,
+    };
+  }
+  return { x: 0, y: 0 };
+}
+
+/**
+ * Replace a GROUP with an equivalent FRAME in-place so it can use
+ * layoutPositioning ABSOLUTE inside page Auto Layout.
+ */
+export function convertGroupToFrame(group: GroupNode): FrameNode {
+  const parent = group.parent;
+  if (!parent || !("appendChild" in parent)) {
+    throw new Error(`Group "${group.name}" has no parent`);
+  }
+
+  const index = parent.children.indexOf(group);
+  const groupBox = group.absoluteBoundingBox;
+  const children = [...group.children].map((child) => ({
+    node: child,
+    snap: snapAbs(child),
+  }));
+
+  const frame = figma.createFrame();
+  frame.name = group.name;
+  frame.resizeWithoutConstraints(
+    Math.max(1, groupBox?.width ?? group.width),
+    Math.max(1, groupBox?.height ?? group.height),
+  );
+  const origin = parentAbsOrigin(parent as BaseNode & ChildrenMixin);
+  if (groupBox) {
+    frame.x = groupBox.x - origin.x;
+    frame.y = groupBox.y - origin.y;
+  } else {
+    frame.x = group.x;
+    frame.y = group.y;
+  }
+  frame.fills = [];
+  frame.clipsContent = false;
+
+  if ("opacity" in group) frame.opacity = group.opacity;
+  if ("blendMode" in group) frame.blendMode = group.blendMode;
+  if ("isMask" in group) frame.isMask = group.isMask;
+  if ("locked" in group) frame.locked = group.locked;
+  if ("visible" in group) frame.visible = group.visible;
+
+  parent.insertChild(index >= 0 ? index : parent.children.length, frame);
+
+  for (const { node, snap } of children) {
+    if (!node.parent) continue;
+    try {
+      frame.appendChild(node);
+      if (snap) {
+        const frameAbs = frame.absoluteBoundingBox;
+        if (frameAbs) {
+          placeLocalBox(node, snap.x - frameAbs.x, snap.y - frameAbs.y);
+        }
+      }
+    } catch (e) {
+      logError(`group→frame reparent failed (${safeNodeRef(node)})`, e);
+    }
+  }
+
+  try {
+    if (group.parent) group.remove();
+  } catch (e) {
+    logError(`group→frame remove failed (${safeNodeRef(group)})`, e);
+  }
+  return frame;
 }
 
 /**
@@ -178,6 +263,37 @@ function restoreNodeAbs(node: SceneNode, target: AbsSnap): void {
     target.w,
     target.h,
   );
+}
+
+/**
+ * Turn off parent Auto Layout but keep tidy wrappers: restore each direct
+ * child's box from a mid-apply snapshot (taken after wrappers were built).
+ */
+export function revertParentAutoLayoutKeepWrappers(
+  frame: FrameNode,
+  mid: Map<string, AbsSnap>,
+): void {
+  try {
+    if ("layoutMode" in frame && frame.layoutMode !== "NONE") {
+      frame.layoutMode = "NONE";
+    }
+  } catch (e) {
+    logError(`parent layoutMode NONE failed (${safeNodeRef(frame)})`, e);
+  }
+
+  const frameSnap = mid.get(frame.id);
+  if (frameSnap && "resize" in frame) {
+    try {
+      frame.resize(Math.max(1, frameSnap.w), Math.max(1, frameSnap.h));
+    } catch (e) {
+      logError(`parent resize failed (${safeNodeRef(frame)})`, e);
+    }
+  }
+
+  for (const child of [...frame.children] as SceneNode[]) {
+    const snap = mid.get(child.id);
+    if (snap) restoreNodeAbs(child, snap);
+  }
 }
 
 /**
@@ -247,4 +363,243 @@ export function restoreFramePixelPerfect(
   } finally {
     if (wasLocked) frame.locked = true;
   }
+}
+
+/** Stamp DFS paint indices on the clone before any reparenting. */
+export function stampPaintOrder(root: SceneNode): void {
+  let i = 0;
+  const visit = (node: SceneNode) => {
+    try {
+      if ("setPluginData" in node) {
+        (node as FrameNode).setPluginData(TIDY_PAINT_KEY, String(i++));
+      }
+    } catch (e) {
+      logError(`stamp paint order failed (${safeNodeRef(node)})`, e);
+    }
+    if ("children" in node) {
+      for (const child of (node as ChildrenMixin).children) {
+        visit(child as SceneNode);
+      }
+    }
+  };
+  visit(root);
+}
+
+function readPaintKey(node: SceneNode): number | null {
+  try {
+    if (!("getPluginData" in node)) return null;
+    const raw = (node as FrameNode).getPluginData(TIDY_PAINT_KEY);
+    if (!raw) return null;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Min paint key in subtree (new wrapper frames inherit from their leaves). */
+export function paintKey(node: SceneNode): number {
+  const own = readPaintKey(node);
+  if (own !== null) return own;
+  if ("children" in node && node.children.length > 0) {
+    let min = Infinity;
+    for (const child of (node as ChildrenMixin).children) {
+      min = Math.min(min, paintKey(child as SceneNode));
+    }
+    if (min !== Infinity) return min;
+  }
+  return 1e9;
+}
+
+function isOpaqueCover(node: SceneNode): boolean {
+  if (node.visible === false) return false;
+  if ((node.opacity ?? 1) < 0.15) return false;
+  if (
+    node.type !== "RECTANGLE" &&
+    node.type !== "ELLIPSE" &&
+    node.type !== "VECTOR" &&
+    node.type !== "FRAME" &&
+    node.type !== "GROUP" &&
+    node.type !== "BOOLEAN_OPERATION"
+  ) {
+    return false;
+  }
+  if (!("fills" in node)) return false;
+  const fills = (node as MinimalFillsMixin).fills;
+  if (fills === figma.mixed || !Array.isArray(fills)) return false;
+  return fills.some(
+    (f) =>
+      f &&
+      f.visible !== false &&
+      (f.type === "SOLID" ||
+        f.type === "IMAGE" ||
+        f.type === "GRADIENT_LINEAR" ||
+        f.type === "GRADIENT_RADIAL"),
+  );
+}
+
+function collectsText(node: SceneNode): SceneNode[] {
+  const out: SceneNode[] = [];
+  const visit = (n: SceneNode) => {
+    if (n.type === "TEXT") out.push(n);
+    if ("children" in n) {
+      for (const c of (n as ChildrenMixin).children) visit(c as SceneNode);
+    }
+  };
+  visit(node);
+  return out;
+}
+
+function coversCenter(cover: SceneNode, target: SceneNode): boolean {
+  const cb = cover.absoluteBoundingBox;
+  const tb = target.absoluteBoundingBox;
+  if (!cb || !tb) return false;
+  const cx = tb.x + tb.width / 2;
+  const cy = tb.y + tb.height / 2;
+  return (
+    cx >= cb.x &&
+    cx <= cb.x + cb.width &&
+    cy >= cb.y &&
+    cy <= cb.y + cb.height &&
+    cb.width * cb.height > tb.width * tb.height * 0.5
+  );
+}
+
+/**
+ * Reparent opaque layers that sit on top of text but originally painted *between*
+ * a wrapper's back layer and its text (e.g. contact card fill covering phone text).
+ * Only touches tidy wrapper hosts — never reshuffles the whole tree.
+ */
+export function fixCoveringPaintOrder(root: SceneNode): void {
+  const isTidyHost = (node: SceneNode): boolean => {
+    try {
+      return (
+        node.type === "FRAME" &&
+        typeof (node as FrameNode).getPluginData === "function" &&
+        (node as FrameNode).getPluginData(TIDY_WRAPPER_KEY) === "1"
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const visit = (parent: SceneNode) => {
+    if (!("children" in parent) || !("insertChild" in parent)) return;
+    const frame = parent as FrameNode & ChildrenMixin;
+    // Skip Auto Layout parents — child order is flow order.
+    if (
+      "layoutMode" in frame &&
+      frame.layoutMode !== "NONE" &&
+      frame.layoutMode !== undefined
+    ) {
+      for (const child of [...frame.children] as SceneNode[]) {
+        visit(child);
+      }
+      return;
+    }
+
+    let guard = 0;
+    while (guard++ < 32) {
+      const kids = [...frame.children] as SceneNode[];
+      let moved = false;
+      for (const cover of kids) {
+        if (cover.visible === false) continue;
+        if (!isOpaqueCover(cover)) continue;
+        const coverKey = paintKey(cover);
+        for (const host of kids) {
+          if (host === cover || !isTidyHost(host)) continue;
+          if (
+            "layoutMode" in host &&
+            (host as FrameNode).layoutMode !== "NONE" &&
+            (host as FrameNode).layoutMode !== undefined
+          ) {
+            continue;
+          }
+          const texts = collectsText(host).filter(
+            (t) => t.visible !== false && coversCenter(cover, t),
+          );
+          if (texts.length === 0) continue;
+          if (!texts.some((t) => paintKey(t) > coverKey)) continue;
+          // Host must also contain something behind the cover (lower paint key).
+          const hostKey = paintKey(host);
+          if (hostKey >= coverKey) continue;
+
+          const snap = snapAbs(cover);
+          const hostKids = [...host.children] as SceneNode[];
+          let at = hostKids.findIndex((k) => paintKey(k) > coverKey);
+          if (at < 0) at = hostKids.length;
+          try {
+            host.insertChild(at, cover);
+            if (snap) {
+              const hb = host.absoluteBoundingBox;
+              if (hb) {
+                placeLocalBox(
+                  cover,
+                  snap.x - hb.x,
+                  snap.y - hb.y,
+                  snap.w,
+                  snap.h,
+                );
+              }
+            }
+            moved = true;
+          } catch (e) {
+            logError(
+              `fix covering paint order failed (${safeNodeRef(cover)})`,
+              e,
+            );
+          }
+          break;
+        }
+        if (moved) break;
+      }
+      if (!moved) break;
+    }
+
+    for (const child of [...frame.children] as SceneNode[]) {
+      visit(child);
+    }
+  };
+  visit(root);
+}
+
+/** Stable sibling order by original paint key (freeform parents only). */
+export function restoreSiblingPaintOrder(root: SceneNode): void {
+  const visit = (parent: SceneNode) => {
+    if (!("children" in parent) || !("insertChild" in parent)) return;
+    const frame = parent as FrameNode & ChildrenMixin;
+    if (
+      "layoutMode" in frame &&
+      frame.layoutMode !== "NONE" &&
+      frame.layoutMode !== undefined
+    ) {
+      for (const child of [...frame.children] as SceneNode[]) visit(child);
+      return;
+    }
+    const kids = [...frame.children] as SceneNode[];
+    if (kids.length >= 2) {
+      const sorted = [...kids].sort((a, b) => paintKey(a) - paintKey(b));
+      let same = true;
+      for (let i = 0; i < kids.length; i++) {
+        if (kids[i] !== sorted[i]) {
+          same = false;
+          break;
+        }
+      }
+      if (!same) {
+        for (let i = 0; i < sorted.length; i++) {
+          try {
+            frame.insertChild(i, sorted[i]);
+          } catch (e) {
+            logError(
+              `restore sibling paint order failed (${safeNodeRef(sorted[i])})`,
+              e,
+            );
+          }
+        }
+      }
+    }
+    for (const child of [...frame.children] as SceneNode[]) visit(child);
+  };
+  visit(root);
 }

@@ -79,8 +79,8 @@ export const htmlBlendMode = (
 };
 
 /**
- * Hidden Figma layers stay in the tree for group masks; emit visibility:hidden
- * rather than stripping fills (which breaks nested structure).
+ * Hidden layers are skipped in generate/toJson; this is a last-resort guard if
+ * one still reaches the style builder.
  */
 export const htmlVisibility = (
   node: SceneNodeMixin,

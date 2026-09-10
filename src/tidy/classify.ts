@@ -204,16 +204,21 @@ export function classifyChildren(
   }
 
   // Overlapping siblings that are all decorative (badges, icons) cannot share one Auto Layout flow.
+  // Do NOT trigger on repeated independent pairs (e.g. 5 news tag pills) — that emptied list rows.
   if (rest.length >= 2) {
     const heavilyOverlapped = new Set<ChildGeom>();
     for (const [a, b] of overlapPairs) {
       heavilyOverlapped.add(a);
       heavilyOverlapped.add(b);
     }
+    const allDecorative = [...heavilyOverlapped].every((i) =>
+      isDecorativeOrIconGroup(i.node),
+    );
     if (
-      (overlapPairs.length >= 3 && heavilyOverlapped.size >= 3) ||
-      (heavilyOverlapped.size === rest.length &&
-        overlapPairs.length >= rest.length - 1)
+      allDecorative &&
+      ((overlapPairs.length >= 3 && heavilyOverlapped.size >= 3) ||
+        (heavilyOverlapped.size === rest.length &&
+          overlapPairs.length >= rest.length - 1))
     ) {
       for (const item of heavilyOverlapped) {
         if (flowSet.has(item)) {
@@ -229,7 +234,15 @@ export function classifyChildren(
     const smaller = rectArea(a.rect) <= rectArea(b.rect) ? a : b;
     const larger = smaller === a ? b : a;
     // Badge/icon on a card: small layer centered inside a larger sibling stays absolute overlay.
+    // Keep TEXT sitting on a pill/rect in flow so list rows can wrap tag+date+title together.
+    const textOnPill =
+      smaller.node.type === "TEXT" &&
+      (larger.node.type === "RECTANGLE" ||
+        larger.node.type === "ELLIPSE" ||
+        larger.node.type === "FRAME" ||
+        larger.node.type === "GROUP");
     if (
+      !textOnPill &&
       rectArea(smaller.rect) < rectArea(larger.rect) * 0.4 &&
       containsPoint(
         larger.rect,
@@ -242,7 +255,8 @@ export function classifyChildren(
       continue;
     }
     // Heavy mutual overlap without containment — neither sibling belongs in Auto Layout flow.
-    if (overlapRatioOfMin(a.rect, b.rect) >= 0.5) {
+    // text-on-pill pairs stay in flow so canyon/row wrappers can group them.
+    if (!textOnPill && overlapRatioOfMin(a.rect, b.rect) >= 0.5) {
       if (flowSet.has(a)) {
         absolute.push(a);
         flowSet.delete(a);

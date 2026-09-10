@@ -10,6 +10,7 @@ import {
   childGeom,
   consecutiveGaps,
   isCleanStack,
+  majorGapClusters,
   median,
   nearlyEqual,
   overlapRatioOfMin,
@@ -412,6 +413,202 @@ function buildWrapper(
   };
 }
 
+function pseudoFromBounds(seed: ChildGeom, bounds: Rect): ChildGeom {
+  return {
+    node: seed.node,
+    index: seed.index,
+    rect: bounds,
+    layoutW: bounds.width,
+    layoutH: bounds.height,
+    layoutX: bounds.x,
+    layoutY: bounds.y,
+  };
+}
+
+/**
+ * Wrapper that may contain nested row/col wrappers when the cluster is not a
+ * clean single-axis stack (e.g. a list column of horizontal news rows).
+ */
+function buildDeepWrapper(
+  items: ChildGeom[],
+  axis: "HORIZONTAL" | "VERTICAL",
+  _parentContent: Rect,
+  depth = 0,
+): WrapperSpec {
+  if (items.length < 2 || depth > 2) {
+    return buildWrapper(items, axis, _parentContent);
+  }
+  if (isCleanStack(items, axis)) {
+    return buildWrapper(items, axis, _parentContent);
+  }
+
+  // Inside a vertical column, pack horizontal row bands (and vice versa).
+  const bandAxis = axis;
+  const innerAxis: "HORIZONTAL" | "VERTICAL" =
+    axis === "VERTICAL" ? "HORIZONTAL" : "VERTICAL";
+  const bands = bandSplit(items, bandAxis);
+  if (bands.length >= 2 && bands.some((b) => b.length >= 2)) {
+    return buildWrapperWithNestedBands(
+      items,
+      bands,
+      axis,
+      innerAxis,
+      depth + 1,
+    );
+  }
+
+  // One more canyon split inside the cluster (e.g. sub-columns).
+  const gapAxis = axis === "VERTICAL" ? "HORIZONTAL" : "VERTICAL";
+  const sub = majorGapClusters(items, gapAxis);
+  if (sub && sub.length >= 2) {
+    const subInner: "HORIZONTAL" | "VERTICAL" =
+      gapAxis === "HORIZONTAL" ? "VERTICAL" : "HORIZONTAL";
+    return buildWrapperWithNestedBands(
+      items,
+      sub,
+      gapAxis,
+      subInner,
+      depth + 1,
+    );
+  }
+
+  return buildWrapper(items, axis, _parentContent);
+}
+
+function buildWrapperWithNestedBands(
+  items: ChildGeom[],
+  bands: ChildGeom[][],
+  outerAxis: "HORIZONTAL" | "VERTICAL",
+  innerAxis: "HORIZONTAL" | "VERTICAL",
+  depth: number,
+): WrapperSpec {
+  const bounds = unionRect(items.map((i) => i.rect)) ?? {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+  };
+
+  const nested: WrapperSpec[] = [];
+  const direct: ChildGeom[] = [];
+  const pseudo: ChildGeom[] = [];
+
+  for (const band of bands) {
+    if (band.length >= 2) {
+      const inner = buildDeepWrapper(band, innerAxis, bounds, depth);
+      nested.push({
+        ...inner,
+        bounds: {
+          x: inner.bounds.x - bounds.x,
+          y: inner.bounds.y - bounds.y,
+          width: inner.bounds.width,
+          height: inner.bounds.height,
+        },
+      });
+      pseudo.push(pseudoFromBounds(band[0], inner.bounds));
+    } else {
+      direct.push(band[0]);
+      pseudo.push(band[0]);
+    }
+  }
+
+  const localPseudo: ChildGeom[] = pseudo.map((p) => ({
+    ...p,
+    rect: {
+      x: p.rect.x - bounds.x,
+      y: p.rect.y - bounds.y,
+      width: p.rect.width,
+      height: p.rect.height,
+    },
+  }));
+  const localParent: Rect = {
+    x: 0,
+    y: 0,
+    width: bounds.width,
+    height: bounds.height,
+  };
+  const metrics = inferPrimaryMetrics(localPseudo, localParent, outerAxis);
+  const { parent: counter, perChild } = inferCounterAlign(
+    localPseudo,
+    metrics.contentBox,
+    outerAxis,
+  );
+  const childSizing = direct.map((item) => {
+    const local = {
+      ...item,
+      rect: {
+        x: item.rect.x - bounds.x,
+        y: item.rect.y - bounds.y,
+        width: item.rect.width,
+        height: item.rect.height,
+      },
+    };
+    const s = childSizingFor(local, metrics.contentBox, outerAxis);
+    const align = perChild.get(item.node.id);
+    if (align) s.layoutAlign = align;
+    return s;
+  });
+
+  return {
+    key: nextWrapperKey(),
+    name: wrapperName(items, outerAxis === "HORIZONTAL" ? "row" : "col"),
+    childNodeIds: direct.map((i) => i.node.id),
+    layout: makeLayout(outerAxis, metrics, counter),
+    childSizing,
+    bounds,
+    wrappers: nested.length > 0 ? nested : undefined,
+  };
+}
+
+function structureFromGapClusters(
+  clusters: ChildGeom[][],
+  /** Parent flows along this axis (HORIZONTAL = columns side by side). */
+  parentAxis: "HORIZONTAL" | "VERTICAL",
+  parentRect: Rect,
+): {
+  layout: AutoLayoutSpec | null;
+  wrappers: WrapperSpec[];
+  childSizing: ChildSizingSpec[];
+  fallbackAbsolute: ChildGeom[];
+} {
+  const childAxis: "HORIZONTAL" | "VERTICAL" =
+    parentAxis === "HORIZONTAL" ? "VERTICAL" : "HORIZONTAL";
+  const wrappers: WrapperSpec[] = [];
+  const direct: ChildGeom[] = [];
+  const pseudo: ChildGeom[] = [];
+
+  for (const cluster of clusters) {
+    if (cluster.length === 1) {
+      direct.push(cluster[0]);
+      pseudo.push(cluster[0]);
+      continue;
+    }
+    const w = buildDeepWrapper(cluster, childAxis, parentRect);
+    wrappers.push(w);
+    pseudo.push(pseudoFromBounds(cluster[0], w.bounds));
+  }
+
+  const metrics = inferPrimaryMetrics(pseudo, parentRect, parentAxis);
+  const { parent: counter, perChild } = inferCounterAlign(
+    direct.length === pseudo.length ? direct : pseudo,
+    metrics.contentBox,
+    parentAxis,
+  );
+  const childSizing = direct.map((item) => {
+    const s = childSizingFor(item, metrics.contentBox, parentAxis);
+    const align = perChild.get(item.node.id);
+    if (align) s.layoutAlign = align;
+    return s;
+  });
+
+  return {
+    layout: makeLayout(parentAxis, metrics, counter),
+    wrappers,
+    childSizing,
+    fallbackAbsolute: [],
+  };
+}
+
 function inferStructure(
   flow: ChildGeom[],
   parentRect: Rect,
@@ -500,6 +697,17 @@ function inferStructure(
     };
   }
 
+  // Major canyon split (section chrome | list, etc.) before fine Y-overlap bands —
+  // overlap banding mixes left columns into list rows and then pixel-rollback undoes all tidy.
+  const colClusters = majorGapClusters(flow, "HORIZONTAL");
+  if (colClusters) {
+    return structureFromGapClusters(colClusters, "HORIZONTAL", parentRect);
+  }
+  const rowClusters = majorGapClusters(flow, "VERTICAL");
+  if (rowClusters) {
+    return structureFromGapClusters(rowClusters, "VERTICAL", parentRect);
+  }
+
   // Row bands inside a vertical stack → horizontal wrapper frames per band.
   const rowBands = bandSplit(flow, "VERTICAL");
   if (rowBands.length >= 2 && rowBands.some((b) => b.length >= 2)) {
@@ -509,17 +717,9 @@ function inferStructure(
 
     for (const band of rowBands) {
       if (band.length >= 2) {
-        const w = buildWrapper(band, "HORIZONTAL", parentRect);
+        const w = buildDeepWrapper(band, "HORIZONTAL", parentRect);
         wrappers.push(w);
-        pseudoForParent.push({
-          node: band[0].node,
-          index: band[0].index,
-          rect: w.bounds,
-          layoutW: w.bounds.width,
-          layoutH: w.bounds.height,
-          layoutX: w.bounds.x,
-          layoutY: w.bounds.y,
-        });
+        pseudoForParent.push(pseudoFromBounds(band[0], w.bounds));
       } else {
         direct.push(band[0]);
         pseudoForParent.push(band[0]);
@@ -561,17 +761,9 @@ function inferStructure(
 
     for (const band of colBands) {
       if (band.length >= 2) {
-        const w = buildWrapper(band, "VERTICAL", parentRect);
+        const w = buildDeepWrapper(band, "VERTICAL", parentRect);
         wrappers.push(w);
-        pseudoForParent.push({
-          node: band[0].node,
-          index: band[0].index,
-          rect: w.bounds,
-          layoutW: w.bounds.width,
-          layoutH: w.bounds.height,
-          layoutX: w.bounds.x,
-          layoutY: w.bounds.y,
-        });
+        pseudoForParent.push(pseudoFromBounds(band[0], w.bounds));
       } else {
         direct.push(band[0]);
         pseudoForParent.push(band[0]);
