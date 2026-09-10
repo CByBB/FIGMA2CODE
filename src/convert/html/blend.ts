@@ -92,20 +92,36 @@ export const htmlVisibility = (
   return "";
 };
 
-/** Apply cumulativeRotation from GROUP inlining plus node rotation for CSS transform. */
+/**
+ * CSS transform for layout rotation plus asset flips.
+ * Rotate and scale must be one `transform` — a second `transform:` overrides the first.
+ *
+ * Do not combine CSS flips with rotation when using transform-origin top left:
+ * rotate(180) + scale(-1,1) shifts the visual AABB (News dog landed 119px right
+ * and mirrored). Figma's rotation already places the bitmap; flips alone are OK.
+ */
 export const htmlRotation = (node: RestAltNode, isJsx: boolean): string[] => {
   const rotation =
     -Math.round((node.rotation || 0) + (node.cumulativeRotation || 0)) || 0;
-
+  let sx = (node as { flipHorizontal?: boolean }).flipHorizontal ? -1 : 1;
+  let sy = (node as { flipVertical?: boolean }).flipVertical ? -1 : 1;
   if (rotation !== 0) {
-    return [
-      formatWithJSX(
-        "transform",
-        isJsx,
-        `rotate(${numberToFixedString(rotation)}deg)`,
-      ),
-      formatWithJSX("transform-origin", isJsx, "top left"),
-    ];
+    sx = 1;
+    sy = 1;
   }
-  return [];
+
+  const parts: string[] = [];
+  if (rotation !== 0) {
+    parts.push(`rotate(${numberToFixedString(rotation)}deg)`);
+  }
+  if (sx !== 1 || sy !== 1) {
+    parts.push(`scale(${sx}, ${sy})`);
+  }
+  if (parts.length === 0) return [];
+
+  const styles = [formatWithJSX("transform", isJsx, parts.join(" "))];
+  if (rotation !== 0) {
+    styles.push(formatWithJSX("transform-origin", isJsx, "top left"));
+  }
+  return styles;
 };

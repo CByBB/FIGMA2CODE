@@ -15,13 +15,14 @@ import {
   commonIsAbsolutePosition,
   getCommonPositionValue,
 } from "../layout/position";
+import { commonLetterSpacing } from "../layout/text";
 import { numberToFixedString, stringToClassName } from "../css/numbers";
-import { commonStroke } from "../layout/stroke";
 import {
   formatClassAttribute,
   formatDataAttribute,
   formatStyleAttribute,
 } from "../css/attributes";
+import { commonStroke } from "../layout/stroke";
 import { HTMLSettings } from "types";
 
 export class HtmlDefaultBuilder {
@@ -210,6 +211,24 @@ export class HtmlDefaultBuilder {
       if (node.type === "GROUP" || (node as any).isRelative) {
         this.addStyles(formatWithJSX("position", isJSX, "relative"));
       }
+
+      // Fixed-size AL children must not flex-shrink when a sibling's padding
+      // (or rounding) makes the column taller than the page — that compresses
+      // section frames while absolute décor keeps its top offset.
+      const parent = node.parent;
+      const grows =
+        "layoutGrow" in node &&
+        typeof (node as LayoutMixin).layoutGrow === "number" &&
+        (node as LayoutMixin).layoutGrow > 0;
+      if (
+        !grows &&
+        parent &&
+        "layoutMode" in parent &&
+        parent.layoutMode &&
+        parent.layoutMode !== "NONE"
+      ) {
+        this.addStyles(formatWithJSX("flex-shrink", isJSX, 0));
+      }
     }
 
     return this;
@@ -285,16 +304,54 @@ export class HtmlDefaultBuilder {
     const { width, height, constraints } = htmlSizePartial(node, false);
 
     if (node.type === "TEXT") {
-      switch (node.textAutoResize) {
-        case "WIDTH_AND_HEIGHT":
-          break;
-        case "HEIGHT":
-          this.addStyles(width);
-          break;
-        case "NONE":
-        case "TRUNCATE":
-          this.addStyles(width, height);
-          break;
+      const text = node as TextNode;
+      const chars = "characters" in text ? String(text.characters) : "";
+      const noHardBreak = !chars.includes("\n");
+      const fontSize = typeof text.fontSize === "number" ? text.fontSize : 0;
+
+      // Browser webfonts often measure wider than Figma's box. Pad enough that
+      // hard-broken lines (e.g. Trimming body) do not soft-wrap mid-glyph.
+      let widthStyle = width;
+      if (typeof text.width === "number") {
+        let pad = 2;
+        try {
+          if (
+            text.letterSpacing &&
+            text.letterSpacing !== figma.mixed &&
+            fontSize > 0
+          ) {
+            const ls = commonLetterSpacing(
+              text.letterSpacing as LetterSpacing,
+              fontSize,
+            );
+            if (ls > 0) pad = Math.max(pad, ls);
+          }
+        } catch {
+          /* mixed letterSpacing */
+        }
+        if (fontSize > 0) {
+          pad = Math.max(pad, Math.ceil(fontSize * 0.25));
+        }
+        pad = Math.max(pad, Math.ceil(Math.abs(text.width) * 0.02));
+        widthStyle = formatWithJSX(
+          "width",
+          this.isJSX,
+          Math.max(1, Math.abs(text.width) + pad),
+        );
+      }
+
+      // Soft-wrapped paragraphs (HEIGHT, no \n, clearly >1 line) must still wrap.
+      // Everything else without hard breaks gets nowrap — including tall single-line
+      // labels (e.g. KINDERGARTEN with line-height 35px / font 14px).
+      const softWrapParagraph =
+        text.textAutoResize === "HEIGHT" &&
+        noHardBreak &&
+        fontSize > 0 &&
+        text.height > fontSize * 2.5;
+
+      this.addStyles(widthStyle, height);
+      if (noHardBreak && !softWrapParagraph) {
+        this.addStyles(formatWithJSX("white-space", this.isJSX, "nowrap"));
       }
     } else {
       this.addStyles(width, height);

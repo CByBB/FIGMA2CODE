@@ -19,7 +19,6 @@ import {
 } from "../media/images";
 import { addWarning } from "../warnings";
 import { getCachedAsset } from "../../export/cache";
-import { framedImageTransformCss } from "../../export/flags";
 
 // Walk enriched alt-nodes and emit HTML/CSS strings for preview or ZIP index.html.
 const selfClosingTags = ["img"];
@@ -89,20 +88,22 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
   }
 
   // Prefer baked SVG from ZIP cache (gradient text, icon instances, effect-heavy vectors).
+  // Plugin API uses POLYGON; REST / enriched alt-nodes may still say REGULAR_POLYGON.
   const cachedSvg = node.id ? getCachedAsset(node.id) : undefined;
+  const nodeType = node.type as string;
   if (
     settings.embedVectors &&
     cachedSvg?.format === "SVG" &&
     ((node as any).canBeFlattened ||
-      node.type === "VECTOR" ||
-      node.type === "BOOLEAN_OPERATION" ||
-      node.type === "STAR" ||
-      node.type === "LINE" ||
-      node.type === "POLYGON" ||
-      node.type === "REGULAR_POLYGON" ||
-      node.type === "INSTANCE" ||
-      node.type === "COMPONENT" ||
-      node.type === "TEXT")
+      nodeType === "VECTOR" ||
+      nodeType === "BOOLEAN_OPERATION" ||
+      nodeType === "STAR" ||
+      nodeType === "LINE" ||
+      nodeType === "POLYGON" ||
+      nodeType === "REGULAR_POLYGON" ||
+      nodeType === "INSTANCE" ||
+      nodeType === "COMPONENT" ||
+      nodeType === "TEXT")
   ) {
     (node as any).canBeFlattened = true;
     // Static ZIP: <img src="assets/..."> instead of inlined SVG markup.
@@ -128,21 +129,21 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
   switch ((node as any).type) {
     case "RECTANGLE":
     case "ELLIPSE":
-      return await htmlContainer(node, "", [], settings);
+      return await htmlContainer(node as any, "", [], settings);
     case "GROUP":
-      return await htmlGroup(node, settings);
+      return await htmlGroup(node as GroupNode, settings);
     case "FRAME":
     case "COMPONENT":
     case "INSTANCE":
     case "COMPONENT_SET":
     case "SLOT":
-      return await htmlFrame(node, settings);
+      return await htmlFrame(node as SceneNode & BaseFrameMixin, settings);
     case "SECTION":
-      return await htmlSection(node, settings);
+      return await htmlSection(node as SectionNode, settings);
     case "TEXT":
-      return htmlText(node, settings);
+      return htmlText(node as TextNode, settings);
     case "LINE":
-      return htmlLine(node, settings);
+      return htmlLine(node as LineNode, settings);
     case "VECTOR":
     case "STAR":
     case "POLYGON":
@@ -176,22 +177,51 @@ const htmlWrapSVG = (
   return `\n<div${builder.build()}>\n${indentString(node.svg ?? "")}</div>`;
 };
 
+/**
+ * Figma `exportAsync(SVG)` for LINE is already screen-oriented (matches
+ * renderBounds). Using the pre-rotation CSS box + rotate() squashes a vertical
+ * stroke into a 1px-tall horizontal img and hides it.
+ */
+const lineSvgFileLayoutNode = (node: SceneNode): SceneNode => {
+  if (node.type !== "LINE") return node;
+  const n = node as SceneNode & {
+    absoluteRenderBounds?: Rect | null;
+    absoluteBoundingBox?: Rect | null;
+    cumulativeRotation?: number;
+  };
+  const box = n.absoluteRenderBounds || n.absoluteBoundingBox;
+  if (!box) return node;
+
+  const parentBox =
+    node.parent && "absoluteBoundingBox" in node.parent
+      ? (node.parent as { absoluteBoundingBox?: Rect | null })
+          .absoluteBoundingBox
+      : null;
+
+  return {
+    ...node,
+    width: Math.max(1, box.width || 0),
+    height: Math.max(1, box.height || 0),
+    x: parentBox ? box.x - parentBox.x : n.x,
+    y: parentBox ? box.y - parentBox.y : n.y,
+    rotation: 0,
+    cumulativeRotation: 0,
+  } as SceneNode;
+};
+
 /** ZIP index.html: reference a pre-exported SVG under assets/ rather than inlining. */
 const htmlWrapSVGFile = (
   node: SceneNode,
   settings: HTMLSettings,
   assetPath: string,
 ): string => {
-  const builder = new HtmlDefaultBuilder(node, settings)
+  const layoutNode = lineSvgFileLayoutNode(node);
+  const builder = new HtmlDefaultBuilder(layoutNode, settings)
     .addData("svg-wrapper")
     .commonPositionStyles();
 
-  const tx = framedImageTransformCss(node);
-  const extra: string[] = [];
-  if (tx) {
-    extra.push(formatWithJSX("transform", false, tx));
-  }
-  extra.push(formatWithJSX("display", false, "block"));
+  // Flips are emitted with rotation in htmlRotation (single transform).
+  const extra = [formatWithJSX("display", false, "block")];
 
   return `\n<img${builder.build(extra)} src="${assetPath}" alt="" />`;
 };
@@ -318,15 +348,7 @@ const htmlContainer = async (
       } else {
         tag = "img";
         src = ` src="${imgUrl}"`;
-        if (
-          (node as any).imageAssetFramed ||
-          getCachedAsset(node.id)?.imageAssetFramed
-        ) {
-          const tx = framedImageTransformCss(node);
-          if (tx) {
-            builder.addStyles(formatWithJSX("transform", false, tx));
-          }
-        }
+        // Flip scale is already in htmlRotation via commonPositionStyles → blend.
       }
     }
 

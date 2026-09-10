@@ -27,13 +27,10 @@ export function applyAssetFlagsToTree(nodes: readonly any[]): void {
   for (const n of nodes) walk(n);
 }
 
-/** CSS transform for PNG image fills; export clears rotation on the Figma node first. */
+/** Flip-only fragment; prefer htmlRotation which merges rotate + scale. */
 export function framedImageTransformCss(node: any): string {
-  const parts: string[] = [];
-  const rot = typeof node.rotation === "number" ? node.rotation : 0;
-  if (Math.abs(rot) > 0.05) parts.push(`rotate(${rot}deg)`);
   const sx = node.flipHorizontal ? -1 : 1;
   const sy = node.flipVertical ? -1 : 1;
-  if (sx !== 1 || sy !== 1) parts.push(`scale(${sx}, ${sy})`);
-  return parts.length ? parts.join(" ") : "";
+  if (sx !== 1 || sy !== 1) return `scale(${sx}, ${sy})`;
+  return "";
 }

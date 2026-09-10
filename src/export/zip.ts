@@ -8,6 +8,8 @@ import { CachedAsset, clearAssetCache, setAssetCache } from "./cache";
 import { postBackendMessage } from "../messaging";
 import { EXPORT_TIMEOUT_MS, withTimeout } from "../convert/media/exportAsync";
 import { logError, safeNodeRef } from "../shared/log";
+import { fixSvgLinearGradients } from "../convert/nodes/fixSvgGradients";
+import { utf8Decode, utf8Encode } from "../shared/utf8";
 
 const VECTOR_TYPES = new Set([
   "VECTOR",
@@ -420,9 +422,14 @@ function nodeLayoutFlags(
     if ("relativeTransform" in node) {
       const m = (node as LayoutMixin).relativeTransform;
       const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
-      if (det < 0) {
+      // Reflections only. Pure rotations (det ≈ +1) can still have m[0][0] < 0
+      // at ±180° — that must not be treated as flipHorizontal.
+      if (det < -1e-6) {
         flags.flipHorizontal = m[0][0] < 0;
         flags.flipVertical = m[1][1] < 0;
+        if (!flags.flipHorizontal && !flags.flipVertical) {
+          flags.flipHorizontal = true;
+        }
       }
     }
   } catch {
@@ -499,9 +506,9 @@ async function exportNodeBytes(
   format: ExportFormat,
 ): Promise<ExportResult> {
   const attempts = pngAttempts();
-  const svgAttempts: ExportSettingsSVGString[] = [
-    { format: "SVG", svgIdAttribute: true } as any,
-    { format: "SVG" } as any,
+  const svgAttempts: ExportSettingsSVG[] = [
+    { format: "SVG", svgIdAttribute: true },
+    { format: "SVG" },
   ];
 
   if (format === "PNG" && hasImageFill(node)) {
@@ -513,13 +520,13 @@ async function exportNodeBytes(
   }
 
   if (format === "SVG" && node.type === "TEXT") {
-    return trySettings(node, svgAttempts as ExportSettings[]);
+    return trySettings(node, svgAttempts);
   }
 
   if (format === "SVG") {
     try {
       return await withUnclippedAncestors(node, () =>
-        trySettings(node, svgAttempts as ExportSettings[]),
+        trySettings(node, svgAttempts),
       );
     } catch (e) {
       logError(`SVG export failed (${safeNodeRef(node)})`, e);
@@ -674,9 +681,19 @@ export async function exportZipAssets(
       const result = await exportNodeBytes(node, planned);
       const actual: ExportFormat = result.format === "SVG" ? "SVG" : "PNG";
       if (actual !== planned) formatDrift = true;
+      let bytes = result.bytes;
+      if (actual === "SVG") {
+        try {
+          bytes = utf8Encode(
+            fixSvgLinearGradients(utf8Decode(result.bytes), node),
+          );
+        } catch (e) {
+          logError(`SVG gradient fix failed (${safeNodeRef(node)})`, e);
+        }
+      }
       const rel = assetRelPath(node, actual);
       assetsMap[node.id] = rel;
-      postZipFile(rel, result.bytes);
+      postZipFile(rel, bytes);
       cache.set(node.id, pathOnlyAsset(node, actual, rel));
     } catch (e) {
       logError(`asset export failed (${safeNodeRef(node)})`, e);

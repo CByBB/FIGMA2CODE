@@ -1,7 +1,11 @@
 import { formatMultipleJSX, formatWithJSX } from "../css/format";
 import { HtmlDefaultBuilder } from "./DefaultBuilder";
 import { htmlColorFromFills } from "./color";
-import { commonLetterSpacing, commonLineHeight } from "../layout/text";
+import {
+  commonLetterSpacing,
+  commonLineHeight,
+  unwrapSoftWrapNewlines,
+} from "../layout/text";
 import { HTMLSettings, StyledTextSegmentSubset } from "types";
 
 export class HtmlTextBuilder extends HtmlDefaultBuilder {
@@ -53,13 +57,16 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
             segment.letterSpacing,
             segment.fontSize,
           ),
-          "word-wrap": "break-word",
+          // Do not set word-wrap:break-word — with a slightly tight Figma width,
+          // browsers mid-break CJK/Latin and diverge from Figma's line breaks.
           ...additionalStyles,
         },
         false,
       );
 
-      const charsWithLineBreak = segment.characters.split("\n").join("<br/>");
+      const charsWithLineBreak = unwrapSoftWrapNewlines(segment.characters)
+        .split("\n")
+        .join("<br/>");
       return {
         style: styleAttributes,
         text: charsWithLineBreak,
@@ -125,6 +132,13 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
     const lineHeightProp = commonLineHeight(lineHeight, fontSize);
     if (lineHeightProp > 0) {
       return lineHeightProp;
+    }
+    // AUTO / intrinsic: use Figma's resolved px (from REST style) so hug text
+    // matches the design box instead of the browser default multiplier.
+    const resolved = (this.node as TextNode & { lineHeightPx?: number })
+      .lineHeightPx;
+    if (typeof resolved === "number" && resolved > 0) {
+      return resolved;
     }
     return null;
   }

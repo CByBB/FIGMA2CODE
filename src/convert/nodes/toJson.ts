@@ -408,14 +408,20 @@ const processNodePair = async (
 
     // Flatten style object onto node so HTML builders read font props at top level.
     Object.assign(jsonNode, jsonNode.style);
+    // REST often omits textAutoResize; prefer the live plugin value over NONE.
     if (!jsonNode.textAutoResize) {
-      jsonNode.textAutoResize = "NONE";
+      jsonNode.textAutoResize =
+        "textAutoResize" in figmaNode && figmaNode.textAutoResize
+          ? figmaNode.textAutoResize
+          : "NONE";
     }
   }
 
   if ("absoluteBoundingBox" in jsonNode && jsonNode.absoluteBoundingBox) {
     if (jsonNode.parent) {
-      // JSON_REST_V1 lacks width/height; derive from bounding box and rotation.
+      // JSON_REST_V1 lacks width/height; derive pre-rotation box from AABB.
+      // Negate matches htmlRotation's CSS angle given calculateRectangle's
+      // flipped corner matrix (do not drop this minus — breaks 90° text).
       const rect = calculateRectangleFromBoundingBox(
         {
           width: jsonNode.absoluteBoundingBox.width,
@@ -430,13 +436,14 @@ const processNodePair = async (
         -((jsonNode.rotation || 0) + (jsonNode.cumulativeRotation || 0)),
       );
 
-      jsonNode.width = rect.width;
-      jsonNode.height = rect.height;
+      jsonNode.width = Math.max(1, Math.abs(rect.width) || 0);
+      jsonNode.height = Math.max(1, Math.abs(rect.height) || 0);
       jsonNode.x = rect.left;
       jsonNode.y = rect.top;
     } else {
-      jsonNode.width = jsonNode.absoluteBoundingBox.width;
-      jsonNode.height = jsonNode.absoluteBoundingBox.height;
+      // LINE AABBs are often 0 on the thin axis — keep 1px so <img> strokes stay visible.
+      jsonNode.width = Math.max(1, jsonNode.absoluteBoundingBox.width || 0);
+      jsonNode.height = Math.max(1, jsonNode.absoluteBoundingBox.height || 0);
       jsonNode.x = 0;
       jsonNode.y = 0;
     }

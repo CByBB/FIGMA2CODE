@@ -5,6 +5,7 @@
 import { PluginSettings } from "types";
 import { lockedHtmlSettings } from "../convert/settings";
 import { htmlMain } from "../convert/html/generate";
+import { googleFontsHeadHtml } from "./googleFonts";
 
 function escapeHtml(text: string): string {
   return String(text || "")
@@ -30,6 +31,7 @@ export async function buildZipIndexHtml(
   const body = rewriteDataUrlsToRelativePaths(output.html);
   const css = output.css ? `\n${output.css}\n` : "";
   const safeTitle = escapeHtml(title || "Figma export");
+  const fontLinks = googleFontsHeadHtml(nodes);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -37,8 +39,8 @@ export async function buildZipIndexHtml(
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${safeTitle}</title>
-  <style>
-    html, body { margin: 0; padding: 0; overflow-x: hidden; }
+${fontLinks}  <style>
+    html, body { margin: 0; padding: 0; overflow-x: clip; }
     body { background: #fff; }
 ${css}  </style>
 </head>

@@ -107,5 +107,23 @@ export const commonIsAbsolutePosition = (node: SceneNode) => {
     return true;
   }
 
+  // Decorative vectors inside Auto Layout are often left as in-flow siblings
+  // (e.g. Trimming Path 61). Emit absolute AABB placement so they do not depend
+  // on flex gap packing to land on overlays like photos.
+  if (
+    (node.type === "VECTOR" ||
+      node.type === "BOOLEAN_OPERATION" ||
+      node.type === "STAR" ||
+      node.type === "LINE" ||
+      node.type === "POLYGON" ||
+      (node.type as string) === "REGULAR_POLYGON") &&
+    "absoluteBoundingBox" in node &&
+    node.absoluteBoundingBox &&
+    "layoutGrow" in node &&
+    (node as LayoutMixin & { layoutGrow?: number }).layoutGrow === 0
+  ) {
+    return true;
+  }
+
   return false;
 };

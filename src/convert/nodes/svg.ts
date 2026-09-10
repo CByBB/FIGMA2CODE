@@ -7,6 +7,7 @@ import { htmlColor } from "../html/color";
 import { getCachedAsset } from "../../export/cache";
 import { utf8Decode } from "../../shared/utf8";
 import { logError, safeNodeRef, isExpectedExportError } from "../../shared/log";
+import { fixSvgLinearGradients } from "./fixSvgGradients";
 
 // SVG flatten: exportAsync or ZIP cache, then rewrite literal colors to CSS variables.
 export const overrideReadonlyProperty = curry(
@@ -63,7 +64,7 @@ export const renderAndAttachSVG = async (node: any) => {
     const cached = node.id ? getCachedAsset(node.id) : undefined;
     if (cached && cached.format === "SVG" && cached.bytes) {
       try {
-        node.svg = utf8Decode(cached.bytes);
+        node.svg = fixSvgLinearGradients(utf8Decode(cached.bytes), node);
         return node;
       } catch (e) {
         logError(`cached SVG decode failed (${safeNodeRef(node)})`, e);
@@ -118,9 +119,9 @@ export const renderAndAttachSVG = async (node: any) => {
           },
         );
 
-        node.svg = processedSvg;
+        node.svg = fixSvgLinearGradients(processedSvg, node);
       } else {
-        node.svg = svg;
+        node.svg = fixSvgLinearGradients(svg, node);
       }
     } catch (error) {
       if (!isExpectedExportError(error)) {

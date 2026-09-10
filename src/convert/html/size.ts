@@ -19,7 +19,8 @@ export const htmlSizePartial = (
 
   let w = "";
   if (typeof size.width === "number") {
-    w = formatWithJSX("width", isJsx, size.width);
+    // Zero-size axes (Figma LINE AABBs) collapse <img>/SVG strokes in CSS.
+    w = formatWithJSX("width", isJsx, Math.max(1, Math.abs(size.width) || 0));
   } else if (size.width === "fill") {
     if (
       nodeParent &&
@@ -38,7 +39,7 @@ export const htmlSizePartial = (
 
   let h = "";
   if (typeof size.height === "number") {
-    h = formatWithJSX("height", isJsx, size.height);
+    h = formatWithJSX("height", isJsx, Math.max(1, Math.abs(size.height) || 0));
   } else if (typeof size.height === "string") {
     if (
       nodeParent &&

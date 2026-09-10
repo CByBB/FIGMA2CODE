@@ -8,6 +8,7 @@
     "build:ui": "vite build --minify oxc --emptyOutDir=false",
     "build:watch": "concurrently -n plugin,ui \"pnpm run build:main --watch\" \"pnpm run build:ui --watch\"",
     "dev": "pnpm build:watch",
+    "dev:temp": "node scripts/watch-temp-zips.mjs",
     "lint": "eslint src --max-warnings=0",
     "format": "prettier --write \"**/*.{ts,tsx,css,md,json}\"",
     "format:check": "prettier --check \"**/*.{ts,tsx,css,md,json}\"",
