@@ -890,18 +890,28 @@ export function ensurePageVerticalFlow(
   page: FrameNode,
   flowFrames?: FrameNode[],
 ): void {
+  const pageW = page.width;
+  const minSectionW = pageW * SECTION_WIDTH_RATIO;
+
   let sections: FrameNode[];
   if (flowFrames && flowFrames.length > 0) {
     sections = flowFrames.filter((s) => s.parent === page);
   } else {
-    sections = [...page.children].filter(
-      (c) =>
-        c.type === "FRAME" &&
-        !(
-          "layoutPositioning" in c &&
-          (c as FrameNode).layoutPositioning === "ABSOLUTE"
-        ),
-    ) as FrameNode[];
+    // Full-bleed shells only — ignore narrow décor frames already on the page.
+    // Keep ABSOLUTE out so intentional overlap pins (JOIN vs table) stay pinned;
+    // false pins from décor are prevented in pinOverlappingRootFrames.
+    sections = [...page.children].filter((c) => {
+      if (c.type !== "FRAME" || c.visible === false) return false;
+      if (c.width < minSectionW) return false;
+      if (
+        "layoutPositioning" in c &&
+        (c as FrameNode).layoutPositioning === "ABSOLUTE"
+      ) {
+        return false;
+      }
+      if (isLiftedOverflowOverlay(c)) return false;
+      return true;
+    }) as FrameNode[];
     // After apply/rollback, prefer page-local Y (band tops) over layer order.
     sections.sort((a, b) => a.y - b.y || a.x - b.x);
   }
@@ -986,9 +996,9 @@ function isLiftedOverflowOverlay(node: SceneNode): boolean {
 }
 
 /**
- * Paint order: underlays → flow sections → lifted bleed decorations.
- * Lifted nodes must sit above sections or section fills cover them.
- * insertChild only — no resize/style changes.
+ * Paint order: underlays → flow sections → page-absolute overlays.
+ * Plugin-data markers are lost across group→frame / apply rollback, so any
+ * ABSOLUTE non-section child is treated as an overlay (must sit above fills).
  */
 function reorderPageFlowChildren(
   page: FrameNode,
@@ -998,8 +1008,12 @@ function reorderPageFlowChildren(
     sectionsInOrder.filter((s) => s.parent === page).map((s) => s.id),
   );
   const nonFlow = [...page.children].filter((n) => !flowIds.has(n.id));
-  const underlays = nonFlow.filter((n) => !isLiftedOverflowOverlay(n));
-  const lifted = nonFlow.filter((n) => isLiftedOverflowOverlay(n));
+  const isOverlay = (n: SceneNode) =>
+    isLiftedOverflowOverlay(n) ||
+    ("layoutPositioning" in n &&
+      (n as FrameNode).layoutPositioning === "ABSOLUTE");
+  const underlays = nonFlow.filter((n) => !isOverlay(n));
+  const lifted = nonFlow.filter((n) => isOverlay(n));
 
   let at = 0;
   for (const node of underlays) {
@@ -1040,13 +1054,13 @@ function flowPageAsVerticalSections(
 }
 
 /**
- * Decorations that bleed vertically past a section box get covered by the next
- * section in page Auto Layout. Lift those to the page as ABSOLUTE overlays
- * (world position kept) so they can span section boundaries.
+ * Decorations that bleed *down* past an unclipped section get covered by the
+ * next section fill in page Auto Layout. Lift those to the page as ABSOLUTE
+ * overlays (world position kept) so they can span section boundaries.
  *
- * Horizontal-only overflow stays inside the section (clipsContent=false) —
- * lifting it under/over the section stack hides content that should sit on top
- * of the section's own artwork (e.g. About Realm side photo over the cream blob).
+ * Do not lift from clipped sections — overflow was never visible, and moving
+ * the node would also hide the in-bounds jagged divider under the section fill.
+ * Upward overflow stays in the later section (it already paints above the previous).
  */
 export function liftOverflowDecorations(
   page: FrameNode,
@@ -1068,20 +1082,12 @@ export function liftOverflowDecorations(
   const pageW = page.width;
 
   for (const section of flowSections) {
-    try {
-      section.clipsContent = false;
-    } catch (e) {
-      logError(
-        `section clipsContent=false failed (${safeNodeRef(section)})`,
-        e,
-      );
-    }
-
     const secBox = section.absoluteBoundingBox;
     if (!secBox) continue;
+    const clips = section.clipsContent === true;
 
     for (const child of [...section.children] as SceneNode[]) {
-      if (!shouldLiftOverflowDecoration(child, secBox, pageW)) continue;
+      if (!shouldLiftOverflowDecoration(child, secBox, pageW, clips)) continue;
       let node: SceneNode = child;
       try {
         // Groups can't sit ABSOLUTE in page AL — convert first or they stack in flow.
@@ -1121,16 +1127,19 @@ function shouldLiftOverflowDecoration(
   node: SceneNode,
   sectionBox: { x: number; y: number; width: number; height: number },
   pageWidth: number,
+  sectionClips: boolean,
 ): boolean {
+  if (sectionClips) return false;
   if (node.visible === false) return false;
   const box = node.absoluteBoundingBox;
   if (!box) return false;
 
-  // Only vertical bleed needs lifting (next section would cover it).
-  const overflowY =
-    Math.max(0, sectionBox.y - box.y) +
-    Math.max(0, box.y + box.height - (sectionBox.y + sectionBox.height));
-  if (overflowY < 8) return false;
+  // Only downward bleed is covered by the next sibling's fill.
+  const overflowBottom = Math.max(
+    0,
+    box.y + box.height - (sectionBox.y + sectionBox.height),
+  );
+  if (overflowBottom < 8) return false;
 
   // Full-bleed section canvases stay put (even if they slightly overrun).
   const nearlyFullWidth = box.width >= pageWidth * 0.9;
@@ -1213,12 +1222,6 @@ function normalizePromotedSection(
         );
       }
     }
-  }
-  // Allow decorative bleed into neighboring sections (page stack would cover it otherwise).
-  try {
-    section.clipsContent = false;
-  } catch (e) {
-    logError(`promote section clips failed (${safeNodeRef(section)})`, e);
   }
 }
 

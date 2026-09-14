@@ -1,6 +1,5 @@
 import { numberToFixedString } from "../css/numbers";
 import { formatWithJSX } from "../css/format";
-import { RestAltNode } from "types";
 
 /** Node opacity [0,1] → CSS opacity when not fully opaque. */
 export const htmlOpacity = (
@@ -100,11 +99,81 @@ export const htmlVisibility = (
  * rotate(180) + scale(-1,1) shifts the visual AABB (News dog landed 119px right
  * and mirrored). Figma's rotation already places the bitmap; flips alone are OK.
  */
-export const htmlRotation = (node: RestAltNode, isJsx: boolean): string[] => {
-  const rotation =
-    -Math.round((node.rotation || 0) + (node.cumulativeRotation || 0)) || 0;
-  let sx = (node as { flipHorizontal?: boolean }).flipHorizontal ? -1 : 1;
-  let sy = (node as { flipVertical?: boolean }).flipVertical ? -1 : 1;
+export const getCssRotationDeg = (node: SceneNode): number => {
+  const extra = node as SceneNode & { cumulativeRotation?: number };
+  const baseRotation =
+    "rotation" in node && typeof (node as LayoutMixin).rotation === "number"
+      ? (node as LayoutMixin).rotation
+      : 0;
+  return -Math.round(baseRotation + (extra.cumulativeRotation || 0)) || 0;
+};
+
+/**
+ * In-flow Auto Layout uses the axis-aligned box; CSS width/height are the
+ * pre-rotation box. Without a slot, HUG parents size to ~58px for a 16px-tall
+ * vertical FEATURE label and the rotate origin is wrong.
+ */
+export const getRotationLayoutSlot = (
+  node: SceneNode,
+): {
+  width: number;
+  height: number;
+  innerLeft: number;
+  innerTop: number;
+} | null => {
+  if (getCssRotationDeg(node) === 0) return null;
+
+  const parent = node.parent;
+  if (
+    !parent ||
+    !("layoutMode" in parent) ||
+    !parent.layoutMode ||
+    parent.layoutMode === "NONE"
+  ) {
+    return null;
+  }
+
+  // Absolutely positioned nodes already place via left/top from toJson.
+  if (
+    "layoutPositioning" in node &&
+    (node as SceneNode & { layoutPositioning?: string }).layoutPositioning ===
+      "ABSOLUTE"
+  ) {
+    return null;
+  }
+
+  const aabb =
+    "absoluteBoundingBox" in node
+      ? (node as LayoutMixin & { absoluteBoundingBox?: Rect | null })
+          .absoluteBoundingBox
+      : null;
+  const parentBox =
+    "absoluteBoundingBox" in parent
+      ? (parent as { absoluteBoundingBox?: Rect | null }).absoluteBoundingBox
+      : null;
+  if (!aabb || !parentBox) return null;
+
+  const aabbRelX = aabb.x - parentBox.x;
+  const aabbRelY = aabb.y - parentBox.y;
+  const nodeX = typeof node.x === "number" ? node.x : aabbRelX;
+  const nodeY = typeof node.y === "number" ? node.y : aabbRelY;
+
+  return {
+    width: Math.max(1, aabb.width || 0),
+    height: Math.max(1, aabb.height || 0),
+    innerLeft: nodeX - aabbRelX,
+    innerTop: nodeY - aabbRelY,
+  };
+};
+
+export const htmlRotation = (node: SceneNode, isJsx: boolean): string[] => {
+  const extra = node as SceneNode & {
+    flipHorizontal?: boolean;
+    flipVertical?: boolean;
+  };
+  const rotation = getCssRotationDeg(node);
+  let sx = extra.flipHorizontal ? -1 : 1;
+  let sy = extra.flipVertical ? -1 : 1;
   if (rotation !== 0) {
     sx = 1;
     sy = 1;

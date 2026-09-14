@@ -11,11 +11,18 @@ import { buildBackgroundValues, htmlColorFromFills } from "./color";
 import { htmlPadding } from "./padding";
 import { htmlSizePartial } from "./size";
 import { htmlBorderRadius } from "./borderRadius";
+import { htmlGridChildProps } from "./autoLayout";
 import {
   commonIsAbsolutePosition,
   getCommonPositionValue,
 } from "../layout/position";
-import { commonLetterSpacing } from "../layout/text";
+import {
+  commonLetterSpacing,
+  commonLineHeight,
+  textBoxLooksMultiline,
+  textContentExceedsLayoutWidth,
+} from "../layout/text";
+import { textOverflowsLayoutBox } from "../layout/bakeLines";
 import { numberToFixedString, stringToClassName } from "../css/numbers";
 import {
   formatClassAttribute,
@@ -59,7 +66,13 @@ export class HtmlDefaultBuilder {
     this.size();
     this.autoLayoutPadding();
     this.position();
+    this.gridChild();
     this.blend();
+    return this;
+  }
+
+  gridChild(): this {
+    this.addStyles(...htmlGridChildProps(this.node));
     return this;
   }
 
@@ -84,7 +97,7 @@ export class HtmlDefaultBuilder {
     const { node, isJSX } = this;
     this.addStyles(
       htmlVisibility(node, isJSX),
-      ...htmlRotation(node as LayoutMixin, isJSX),
+      ...htmlRotation(node, isJSX),
       htmlOpacity(node as MinimalBlendMixin, isJSX),
       htmlBlendMode(node as MinimalBlendMixin, isJSX),
     );
@@ -121,7 +134,18 @@ export class HtmlDefaultBuilder {
       }
       const weight = commonBorder.all;
 
-      if (
+      // INSIDE + strokesIncludedInLayout: stroke is part of the frame size and
+      // shrinks the content box (hero white matte). CSS border + border-box
+      // matches; inset outline paints over the image and drops the extra size.
+      const strokesInLayout =
+        "strokesIncludedInLayout" in node &&
+        (node as FrameNode).strokesIncludedInLayout === true;
+      if (strokeAlign === "INSIDE" && strokesInLayout) {
+        this.addStyles(
+          formatWithJSX("box-sizing", this.isJSX, "border-box"),
+          formatWithJSX("border", this.isJSX, consolidateBorders(weight)),
+        );
+      } else if (
         strokeAlign === "CENTER" ||
         strokeAlign === "OUTSIDE" ||
         node.type === "FRAME" ||
@@ -149,7 +173,7 @@ export class HtmlDefaultBuilder {
           );
         }
       } else {
-        // INSIDE stroke on auto-layout frames maps cleanly to border.
+        // INSIDE stroke on non-frame shapes maps cleanly to border.
         this.addStyles(
           formatWithJSX("border", this.isJSX, consolidateBorders(weight)),
         );
@@ -225,9 +249,10 @@ export class HtmlDefaultBuilder {
         parent &&
         "layoutMode" in parent &&
         parent.layoutMode &&
-        parent.layoutMode !== "NONE"
+        parent.layoutMode !== "NONE" &&
+        parent.layoutMode !== "GRID"
       ) {
-        this.addStyles(formatWithJSX("flex-shrink", isJSX, 0));
+        this.addStyles(formatWithJSX("flex-shrink", isJSX, "0"));
       }
     }
 
@@ -309,48 +334,123 @@ export class HtmlDefaultBuilder {
       const noHardBreak = !chars.includes("\n");
       const fontSize = typeof text.fontSize === "number" ? text.fontSize : 0;
 
-      // Browser webfonts often measure wider than Figma's box. Pad enough that
-      // hard-broken lines (e.g. Trimming body) do not soft-wrap mid-glyph.
-      let widthStyle = width;
-      if (typeof text.width === "number") {
-        let pad = 2;
-        try {
-          if (
-            text.letterSpacing &&
-            text.letterSpacing !== figma.mixed &&
-            fontSize > 0
-          ) {
-            const ls = commonLetterSpacing(
-              text.letterSpacing as LetterSpacing,
-              fontSize,
-            );
-            if (ls > 0) pad = Math.max(pad, ls);
-          }
-        } catch {
-          /* mixed letterSpacing */
+      let lineHeightPx = fontSize > 0 ? fontSize * 1.2 : 0;
+      try {
+        if (
+          text.lineHeight &&
+          text.lineHeight !== figma.mixed &&
+          fontSize > 0
+        ) {
+          const lh = commonLineHeight(text.lineHeight as LineHeight, fontSize);
+          if (lh > 0) lineHeightPx = lh;
         }
-        if (fontSize > 0) {
-          pad = Math.max(pad, Math.ceil(fontSize * 0.25));
-        }
-        pad = Math.max(pad, Math.ceil(Math.abs(text.width) * 0.02));
-        widthStyle = formatWithJSX(
-          "width",
-          this.isJSX,
-          Math.max(1, Math.abs(text.width) + pad),
-        );
+      } catch {
+        /* mixed lineHeight */
+      }
+      const fromStyle = (text as TextNode & { lineHeightPx?: number })
+        .lineHeightPx;
+      if (typeof fromStyle === "number" && fromStyle > 0) {
+        lineHeightPx = fromStyle;
       }
 
-      // Soft-wrapped paragraphs (HEIGHT, no \n, clearly >1 line) must still wrap.
-      // Everything else without hard breaks gets nowrap — including tall single-line
-      // labels (e.g. KINDERGARTEN with line-height 35px / font 14px).
+      let letterSpacingPx = 0;
+      try {
+        if (
+          text.letterSpacing &&
+          text.letterSpacing !== figma.mixed &&
+          fontSize > 0
+        ) {
+          letterSpacingPx = commonLetterSpacing(
+            text.letterSpacing as LetterSpacing,
+            fontSize,
+          );
+        }
+      } catch {
+        /* mixed letterSpacing */
+      }
+      const fromLs = (text as TextNode & { letterSpacing?: number })
+        .letterSpacing;
+      if (
+        letterSpacingPx === 0 &&
+        typeof fromLs === "number" &&
+        Number.isFinite(fromLs)
+      ) {
+        letterSpacingPx = fromLs;
+      }
+
+      // Prefer Figma-baked visual `\n` (toJson). Fallback: tall box without `\n`
+      // still allows CSS soft-wrap when baking was skipped (missing font, etc.).
+      const textMeta = text as TextNode & {
+        visualLineBreaksBaked?: boolean;
+        textPaintOverflows?: boolean;
+        textPaintHeight?: number;
+      };
+      const baked = !!textMeta.visualLineBreaksBaked;
+      const overflowsBox =
+        !!textMeta.textPaintOverflows || textOverflowsLayoutBox(text);
+      // Content wider than the box must wrap even when AABB/paint height still
+      // looks like one line (master-course「いまお…」597×69 / nowrap overflow).
+      const contentWiderThanBox = textContentExceedsLayoutWidth(
+        chars,
+        typeof text.width === "number" ? Math.abs(text.width) : 0,
+        fontSize,
+        letterSpacingPx,
+      );
+      const clippedMultilineBody =
+        contentWiderThanBox &&
+        textBoxLooksMultiline(
+          typeof text.height === "number" ? Math.abs(text.height) : 0,
+          fontSize,
+          lineHeightPx,
+        );
+      // Wider-than-box *and* taller-than-one-line copy gets baked <br/> +
+      // nowrap. Single-line Latin labels (Exercise 22px) stay nowrap, no <br/>.
       const softWrapParagraph =
-        text.textAutoResize === "HEIGHT" &&
+        !baked &&
         noHardBreak &&
         fontSize > 0 &&
-        text.height > fontSize * 2.5;
+        !clippedMultilineBody &&
+        (overflowsBox ||
+          text.height > Math.max(fontSize * 2.5, lineHeightPx * 1.5));
 
+      // Keep Figma width (+ small webfont pad). Never estimate a wider box from
+      // AABB height/lineHeight — that turned Gerber 583px into ~1037px.
+      // Soft-wrap fallback (no bake): skip pad so CSS does not wrap later than
+      // Figma and run under overlapping siblings (master-course book card).
+      let widthStyle = width;
+      if (typeof text.width === "number") {
+        let outW = Math.abs(text.width);
+        const allowPad = baked || clippedMultilineBody || !softWrapParagraph;
+        if (allowPad) {
+          let pad = 2;
+          if (letterSpacingPx > 0) pad = Math.max(pad, letterSpacingPx);
+          if (fontSize > 0) {
+            pad = Math.max(pad, Math.ceil(fontSize * 0.25));
+          }
+          pad = Math.max(pad, Math.ceil(outW * 0.02));
+          outW += pad;
+        }
+        // Baked / clipped multiline: tiny slack only — do not grow to full advance.
+        if ((baked || clippedMultilineBody) && fontSize > 0) {
+          outW = Math.max(
+            Math.abs(text.width) + 2,
+            Math.min(outW, Math.abs(text.width) + Math.ceil(fontSize * 0.5)),
+          );
+        }
+        widthStyle = formatWithJSX("width", this.isJSX, Math.max(1, outW));
+      }
+
+      // Height: keep Figma layout AABB. Vertical-align (center) + overflow
+      // visible matches canvas paint. Inflating to paintH or lineCount×lh
+      // (BPS 240px) overlaps the next absolute paragraph.
       this.addStyles(widthStyle, height);
-      if (noHardBreak && !softWrapParagraph) {
+
+      // Pixel-perfect: baked or content-wider (emit <br/>) must not reflow.
+      if (
+        baked ||
+        clippedMultilineBody ||
+        (noHardBreak && !softWrapParagraph)
+      ) {
         this.addStyles(formatWithJSX("white-space", this.isJSX, "nowrap"));
       }
     } else {
@@ -377,7 +477,7 @@ export class HtmlDefaultBuilder {
     const { node } = this;
     if ("effects" in node && node.effects.length > 0) {
       const blur = node.effects.find(
-        (e) => e.type === "LAYER_BLUR" && e.visible,
+        (e): e is BlurEffect => e.type === "LAYER_BLUR" && e.visible !== false,
       );
       if (blur) {
         this.addStyles(
@@ -390,7 +490,8 @@ export class HtmlDefaultBuilder {
       }
 
       const backgroundBlur = node.effects.find(
-        (e) => e.type === "BACKGROUND_BLUR" && e.visible,
+        (e): e is BlurEffect =>
+          e.type === "BACKGROUND_BLUR" && e.visible !== false,
       );
       if (backgroundBlur) {
         this.addStyles(

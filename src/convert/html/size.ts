@@ -16,18 +16,21 @@ export const htmlSizePartial = (
 
   const size = nodeSize(node);
   const nodeParent = node.parent;
+  const parentLayout =
+    nodeParent && "layoutMode" in nodeParent
+      ? (nodeParent as { layoutMode?: string }).layoutMode
+      : undefined;
 
   let w = "";
   if (typeof size.width === "number") {
     // Zero-size axes (Figma LINE AABBs) collapse <img>/SVG strokes in CSS.
     w = formatWithJSX("width", isJsx, Math.max(1, Math.abs(size.width) || 0));
   } else if (size.width === "fill") {
-    if (
-      nodeParent &&
-      "layoutMode" in nodeParent &&
-      nodeParent.layoutMode === "HORIZONTAL"
-    ) {
+    if (parentLayout === "HORIZONTAL") {
       w = formatWithJSX("flex", isJsx, "1 1 0");
+    } else if (parentLayout === "GRID") {
+      // Fill the grid cell on the inline axis (not flex align-self).
+      w = formatWithJSX("width", isJsx, "100%");
     } else {
       if (node.maxWidth) {
         w = formatWithJSX("width", isJsx, "100%");
@@ -41,17 +44,17 @@ export const htmlSizePartial = (
   if (typeof size.height === "number") {
     h = formatWithJSX("height", isJsx, Math.max(1, Math.abs(size.height) || 0));
   } else if (typeof size.height === "string") {
-    if (
-      nodeParent &&
-      "layoutMode" in nodeParent &&
-      nodeParent.layoutMode === "VERTICAL"
-    ) {
-      h = formatWithJSX("flex", isJsx, "1 1 0");
-    } else {
-      if (node.maxHeight) {
+    if (size.height === "fill") {
+      if (parentLayout === "VERTICAL") {
+        h = formatWithJSX("flex", isJsx, "1 1 0");
+      } else if (parentLayout === "GRID") {
         h = formatWithJSX("height", isJsx, "100%");
       } else {
-        h = formatWithJSX("align-self", isJsx, "stretch");
+        if (node.maxHeight) {
+          h = formatWithJSX("height", isJsx, "100%");
+        } else {
+          h = formatWithJSX("align-self", isJsx, "stretch");
+        }
       }
     }
   }

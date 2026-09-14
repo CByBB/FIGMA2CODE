@@ -3,7 +3,14 @@ import { withTimeout } from "../media/exportAsync";
 import { PluginSettings, RestAltNode } from "types";
 import { variableToColorName } from "../color/variables";
 import { Node, Paint } from "../../types/figma-rest";
-import { calculateRectangleFromBoundingBox } from "../layout/position";
+import {
+  calculateRectangleFromBoundingBox,
+  commonIsAbsolutePosition,
+} from "../layout/position";
+import {
+  bakeFigmaVisualLineBreaks,
+  injectSoftBreaksIntoSegment,
+} from "../layout/bakeLines";
 import { isLikelyIcon } from "./icons";
 
 /**
@@ -406,6 +413,52 @@ const processNodePair = async (
       jsonNode.styledTextSegments = styledTextSegments;
     }
 
+    // Bake Figma soft wraps as `\n` so HTML `<br/>` matches the canvas.
+    // Always record paint overflow from the live node — renderBounds often
+    // drop before HTML emit, which previously re-enabled the bad width estimate.
+    try {
+      const live = figmaNode as TextNode;
+      const rb = live.absoluteRenderBounds;
+      const textJson = jsonNode as unknown as {
+        characters: string;
+        visualLineBreaksBaked?: boolean;
+        textPaintOverflows?: boolean;
+        textPaintHeight?: number;
+        styledTextSegments?: Array<{
+          start: number;
+          end: number;
+          characters?: string;
+          [key: string]: unknown;
+        }>;
+      };
+      if (rb && live.height > 0 && rb.height > live.height * 1.15) {
+        textJson.textPaintOverflows = true;
+        textJson.textPaintHeight = rb.height;
+      }
+
+      const baked = await bakeFigmaVisualLineBreaks(live);
+      if (baked && baked.softBreakStarts.length > 0) {
+        const originalChars = live.characters;
+        textJson.characters = baked.characters;
+        textJson.visualLineBreaksBaked = true;
+        if (Array.isArray(textJson.styledTextSegments)) {
+          textJson.styledTextSegments = textJson.styledTextSegments.map(
+            (segment) => ({
+              ...segment,
+              characters: injectSoftBreaksIntoSegment(
+                originalChars,
+                segment.start,
+                segment.end,
+                baked.softBreakStarts,
+              ),
+            }),
+          );
+        }
+      }
+    } catch {
+      /* missing font / clone failure — keep REST characters */
+    }
+
     // Flatten style object onto node so HTML builders read font props at top level.
     Object.assign(jsonNode, jsonNode.style);
     // REST often omits textAutoResize; prefer the live plugin value over NONE.
@@ -562,12 +615,13 @@ const processNodePair = async (
     (jsonNode as RestAltNode & { children: RestAltNode[] }).children =
       processedChildren;
 
+    // Any child that HTML will emit as position:absolute needs a relative
+    // containing block. layoutPositioning alone is not enough — VECTOR icons
+    // inside Auto Layout are forced absolute and were escaping to viewport
+    // (0,0) (Why Bears Navi robot icon pinned to the top-left of the page).
     if (
       jsonNode.layoutMode === "NONE" ||
-      jsonNode.children.some(
-        (d: any) =>
-          "layoutPositioning" in d && d.layoutPositioning === "ABSOLUTE",
-      )
+      jsonNode.children.some((d: any) => commonIsAbsolutePosition(d))
     ) {
       jsonNode.isRelative = true;
     }

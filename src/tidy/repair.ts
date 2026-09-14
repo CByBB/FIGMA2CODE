@@ -11,7 +11,7 @@ import {
   rectArea,
   type Rect,
 } from "./geometry";
-import { placeLocalBox } from "./preserve";
+import { placeLocalBox, TIDY_LIFTED_KEY } from "./preserve";
 import { tidyWarn } from "./warnings";
 import { logError, safeNodeRef } from "../shared/log";
 
@@ -182,11 +182,32 @@ function findVisualHost(
 /**
  * Root frames that substantially overlap in Y cannot both be page flow children —
  * pin the later one absolute (JOIN vs performance table).
+ *
+ * Only compare full-bleed section shells. Lifted décor Groups/Vectors converted
+ * to frames also sit on the page as ABSOLUTE overlays; treating them as section
+ * peers falsely pins real sections (Skills/Projects/…) absolute at the same Y
+ * and collapses the vertical page stack into Hero + Contact only.
  */
 function pinOverlappingRootFrames(root: FrameNode, rootAbs: Rect): number {
-  const frames = root.children.filter(
-    (c) => c.type === "FRAME" && c.visible !== false,
-  ) as FrameNode[];
+  const minSectionW = rootAbs.width * 0.8;
+  const frames = root.children.filter((c) => {
+    if (c.type !== "FRAME" || c.visible === false) return false;
+    if (c.width < minSectionW) return false;
+    if (
+      "layoutPositioning" in c &&
+      (c as FrameNode).layoutPositioning === "ABSOLUTE"
+    ) {
+      return false;
+    }
+    if (
+      "getPluginData" in c &&
+      typeof (c as FrameNode).getPluginData === "function" &&
+      (c as FrameNode).getPluginData(TIDY_LIFTED_KEY) === "1"
+    ) {
+      return false;
+    }
+    return true;
+  }) as FrameNode[];
 
   const rects = frames.map((f) => ({ f, r: rootLocalRect(f, rootAbs) }));
   let pinned = 0;

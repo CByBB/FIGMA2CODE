@@ -4,8 +4,14 @@ import { htmlColorFromFills } from "./color";
 import {
   commonLetterSpacing,
   commonLineHeight,
-  unwrapSoftWrapNewlines,
+  authoredNewlinesExplainBox,
+  textBoxLooksMultiline,
+  textContentExceedsLayoutWidth,
 } from "../layout/text";
+import {
+  bakeSoftBreaksFromAdvanceEstimate,
+  injectSoftBreaksIntoSegment,
+} from "../layout/bakeLines";
 import { HTMLSettings, StyledTextSegmentSubset } from "types";
 
 export class HtmlTextBuilder extends HtmlDefaultBuilder {
@@ -29,6 +35,93 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
       .styledTextSegments as StyledTextSegmentSubset[];
     if (!segments) {
       return [];
+    }
+
+    // Emit-time fallback when toJson bake was skipped (REST dump / SVG lied
+    // single-line). Inject estimated soft breaks so webfont CSS cannot reflow
+    // past overlapping siblings (master-course book).
+    const textMeta = node as TextNode & {
+      visualLineBreaksBaked?: boolean;
+      characters: string;
+    };
+    let emitSoftBreaks: number[] | null = null;
+    if (!textMeta.visualLineBreaksBaked && textMeta.characters) {
+      const fontSize = typeof node.fontSize === "number" ? node.fontSize : 0;
+      let letterSpacingPx = 0;
+      try {
+        if (
+          fontSize > 0 &&
+          node.letterSpacing &&
+          node.letterSpacing !== figma.mixed
+        ) {
+          letterSpacingPx = commonLetterSpacing(
+            node.letterSpacing as LetterSpacing,
+            fontSize,
+          );
+        }
+      } catch {
+        /* mixed */
+      }
+      const layoutW =
+        typeof node.width === "number"
+          ? Math.abs(node.width)
+          : (
+              node as TextNode & {
+                absoluteBoundingBox?: { width?: number } | null;
+              }
+            ).absoluteBoundingBox?.width || 0;
+      const layoutH =
+        typeof node.height === "number" ? Math.abs(node.height) : 0;
+      let lineHeightPx = fontSize > 0 ? fontSize * 1.2 : 0;
+      try {
+        if (
+          fontSize > 0 &&
+          node.lineHeight &&
+          node.lineHeight !== figma.mixed
+        ) {
+          const lh = commonLineHeight(node.lineHeight as LineHeight, fontSize);
+          if (lh > 0) lineHeightPx = lh;
+        }
+      } catch {
+        /* mixed */
+      }
+      const fromLh = (node as TextNode & { lineHeightPx?: number })
+        .lineHeightPx;
+      if (typeof fromLh === "number" && fromLh > 0) lineHeightPx = fromLh;
+      const mixedSizes = Array.isArray(
+        (node as TextNode & { characterStyleOverrides?: unknown[] })
+          .characterStyleOverrides,
+      )
+        ? (
+            node as TextNode & { characterStyleOverrides?: number[] }
+          ).characterStyleOverrides!.some((v) => v !== 0)
+        : false;
+      // Mixed font sizes (鈴木英史 27px + 理事長 18px) make 0.55em/1em
+      // estimate wrap the smaller line. Skip; Figma `\n` already authored.
+      if (
+        fontSize > 0 &&
+        !mixedSizes &&
+        !authoredNewlinesExplainBox(
+          textMeta.characters,
+          layoutH,
+          lineHeightPx,
+        ) &&
+        textBoxLooksMultiline(layoutH, fontSize, lineHeightPx) &&
+        textContentExceedsLayoutWidth(
+          textMeta.characters,
+          layoutW,
+          fontSize,
+          letterSpacingPx,
+        )
+      ) {
+        const estimated = bakeSoftBreaksFromAdvanceEstimate(
+          textMeta.characters,
+          layoutW,
+          fontSize,
+          letterSpacingPx,
+        );
+        if (estimated) emitSoftBreaks = estimated.softBreakStarts;
+      }
     }
 
     return segments.map((segment) => {
@@ -64,9 +157,23 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
         false,
       );
 
-      const charsWithLineBreak = unwrapSoftWrapNewlines(segment.characters)
-        .split("\n")
-        .join("<br/>");
+      let segmentChars = String(segment.characters || "");
+      if (
+        emitSoftBreaks &&
+        typeof segment.start === "number" &&
+        typeof segment.end === "number"
+      ) {
+        segmentChars = injectSoftBreaksIntoSegment(
+          textMeta.characters,
+          segment.start,
+          segment.end,
+          emitSoftBreaks,
+        );
+      }
+
+      // Soft wraps are baked to `\n` in toJson (Figma visual lines). Do not
+      // unwrap — that would let the browser reflow with a different webfont.
+      const charsWithLineBreak = segmentChars.split("\n").join("<br/>");
       return {
         style: styleAttributes,
         text: charsWithLineBreak,
@@ -184,11 +291,17 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
           break;
       }
       if (alignItems) {
+        // Flex column + multiple styled <span>s would stack each segment
+        // as its own row (Hero Title: 『 / 総 / 義歯…). Callers must wrap
+        // all text content in one child — see htmlText().
         this.addStyles(
           formatWithJSX("justify-content", this.isJSX, alignItems),
         );
         this.addStyles(formatWithJSX("display", this.isJSX, "flex"));
         this.addStyles(formatWithJSX("flex-direction", this.isJSX, "column"));
+        (
+          this as { _wrapTextForVerticalAlign?: boolean }
+        )._wrapTextForVerticalAlign = true;
       }
     }
     return this;
