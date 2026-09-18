@@ -17,6 +17,7 @@ import {
 import { PluginSettings } from "types";
 import { oldConvertNodesToAltNodes } from "./nodes/legacy";
 import { clearVariableCache, nodesToJSON } from "./nodes/toJson";
+import { prepareWebFontAvailability } from "../export/googleFonts";
 import { exportZipAssets, planAssetTargets } from "../export/zip";
 import { clearAssetCache } from "../export/cache";
 import { applyAssetFlagsToTree } from "../export/flags";
@@ -87,6 +88,7 @@ export const run = async (settings: PluginSettings) => {
 
     const effectiveSettings = lockedHtmlSettings(settings);
 
+    await prepareWebFontAvailability(selection);
     planAssetTargets(selection);
 
     const converted = await convertSelection(
@@ -152,24 +154,20 @@ export const exportZipPackage = async (settings: PluginSettings) => {
       percent: 88,
     });
 
-    let html =
-      lastPreview && lastPreview.rootId === rootId && !exported.formatDrift
-        ? lastPreview.html
-        : null;
-
-    if (!html) {
-      const converted = await convertSelection(
+    // Always rebuild. A cached preview can still be HTML text for a face that
+    // this download just outlined to SVG (Electroharmonix).
+    let html: string | null = null;
+    const converted = await convertSelection(
+      effectiveSettings,
+      settings.useOldPluginVersion2025,
+    );
+    if (converted) {
+      html = await buildZipIndexHtml(
+        converted.convertedSelection,
         effectiveSettings,
-        settings.useOldPluginVersion2025,
+        selection[0]?.name || "export",
       );
-      if (converted) {
-        html = await buildZipIndexHtml(
-          converted.convertedSelection,
-          effectiveSettings,
-          selection[0]?.name || "export",
-        );
-        lastPreview = { rootId, html };
-      }
+      lastPreview = { rootId, html };
     }
 
     if (html) {

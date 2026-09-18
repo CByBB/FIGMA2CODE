@@ -19,6 +19,20 @@ export function applyAssetFlagsToTree(nodes: readonly any[]): void {
         n.flipHorizontal = cached.flipHorizontal;
       if (cached.flipVertical != null) n.flipVertical = cached.flipVertical;
       if (cached.format === "SVG") n.assetOnly = true;
+      if (
+        cached.format === "PNG" &&
+        Array.isArray(n.children) &&
+        n.children.length > 0
+      ) {
+        const fills = n.fills;
+        const hasImage =
+          Array.isArray(fills) &&
+          fills.some((p: { type?: string }) => p && p.type === "IMAGE");
+        if (!hasImage) {
+          n.assetOnly = true;
+          n.canBeFlattened = true;
+        }
+      }
     }
     if (Array.isArray(n.children)) {
       for (const c of n.children) walk(c);

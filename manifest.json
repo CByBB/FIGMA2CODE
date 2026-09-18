@@ -9,7 +9,7 @@
   "permissions": [],
   "documentAccess": "dynamic-page",
   "networkAccess": {
-    "allowedDomains": ["https://openrouter.ai"]
+    "allowedDomains": ["https://openrouter.ai", "https://fonts.googleapis.com"]
   },
   "codegenLanguages": [{ "label": "HTML", "value": "html" }]
 }

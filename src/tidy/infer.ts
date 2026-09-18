@@ -29,6 +29,7 @@ import {
   classifyChildren,
   isAutoLayoutFrame,
   isDecorativeLayer,
+  isIllustrationSubtree,
   isLeafType,
   isPlainFillShape,
   parentHasFills,
@@ -937,6 +938,49 @@ function inferFrame(
       `Stacked overlapping layers in "${node.name}" kept absolute (not a flow)`,
     );
     flow = [];
+  }
+
+  // Scattered vectors (grain, terrain, splatters) look like Y-aligned "rows" to
+  // bandSplit. Wrapping them adds containing blocks; JSON_REST_V1 then reports
+  // child AABBs in the old ancestor space → HTML double-offsets the artwork.
+  if (flow.length >= 2 && flow.every((i) => isIllustrationSubtree(i.node))) {
+    for (const item of flow) {
+      absoluteChildren.push({
+        nodeId: item.node.id,
+        x: item.rect.x,
+        y: item.rect.y,
+      });
+    }
+    tidyWarn(
+      `Illustration layers in "${node.name}" kept absolute (not a flow)`,
+    );
+    flow = [];
+  }
+
+  // Even when mixed with text/nav, illustration groups (sun, samurai mask, rocks)
+  // must stay absolute. Leaving them in flow lets Auto Layout pack them at (0,0)
+  // — Hero Mask at (584,569) became (0,0) and HTML drew the silhouette top-left.
+  if (flow.length > 0) {
+    const kept: ChildGeom[] = [];
+    let pulled = 0;
+    for (const item of flow) {
+      if (isIllustrationSubtree(item.node)) {
+        absoluteChildren.push({
+          nodeId: item.node.id,
+          x: item.rect.x,
+          y: item.rect.y,
+        });
+        pulled += 1;
+      } else {
+        kept.push(item);
+      }
+    }
+    if (pulled > 0) {
+      flow = kept;
+      tidyWarn(
+        `${pulled} illustration layer(s) in "${node.name}" pinned absolute (mixed with UI flow)`,
+      );
+    }
   }
 
   let foldBackgroundId: string | undefined;

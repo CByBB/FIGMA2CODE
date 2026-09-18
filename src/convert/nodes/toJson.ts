@@ -344,6 +344,31 @@ const processNodePair = async (
     (jsonNode as any).parent = parentNode;
   }
 
+  // JSON_REST_V1 AABB for VECTOR/FRAME can disagree with the plugin after
+  // group→frame and tidy wrappers. Prefer live boxes so HTML left/top match canvas.
+  if ("absoluteBoundingBox" in figmaNode && figmaNode.absoluteBoundingBox) {
+    jsonNode.absoluteBoundingBox = {
+      x: figmaNode.absoluteBoundingBox.x,
+      y: figmaNode.absoluteBoundingBox.y,
+      width: figmaNode.absoluteBoundingBox.width,
+      height: figmaNode.absoluteBoundingBox.height,
+    };
+  }
+  const liveNode = figmaNode as SceneNode & {
+    absoluteRenderBounds?: Rect | null;
+  };
+  if (liveNode.absoluteRenderBounds) {
+    const b = liveNode.absoluteRenderBounds;
+    (
+      jsonNode as RestAltNode & { absoluteRenderBounds: Rect }
+    ).absoluteRenderBounds = {
+      x: b.x,
+      y: b.y,
+      width: b.width,
+      height: b.height,
+    };
+  }
+
   const cleanName = jsonNode.name.trim();
 
   const count = nodeNameCounters.get(cleanName) || 0;

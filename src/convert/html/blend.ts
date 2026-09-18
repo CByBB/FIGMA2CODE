@@ -189,8 +189,37 @@ export const htmlRotation = (node: SceneNode, isJsx: boolean): string[] => {
   if (parts.length === 0) return [];
 
   const styles = [formatWithJSX("transform", isJsx, parts.join(" "))];
+  // Flips must pivot on the layout box center (Figma flip); `top left` is only
+  // for rotate()-based positioning. Wrong origin shifts reflection ink across
+  // the Hero/Skills seam.
   if (rotation !== 0) {
     styles.push(formatWithJSX("transform-origin", isJsx, "top left"));
+  } else if (sx !== 1 || sy !== 1) {
+    styles.push(formatWithJSX("transform-origin", isJsx, "center center"));
   }
   return styles;
 };
+
+/**
+ * Figma `exportAsync({format:"SVG"})` already bakes node flips into the path
+ * (Skills 514:7601 is a vertical mirror of Hero 514:8807 inside the same
+ * viewBox). HTML must NOT apply `scale(1,-1)` on top of that file — doing so
+ * around each child's box center splits terrain from torii at the section seam.
+ *
+ * Clear flip flags on SVG-file children so htmlRotation does not double-flip.
+ * Shared-flip hoisting is the same bug: the flip is already in the asset.
+ */
+export function clearSvgAssetFlips(node: SceneNode): void {
+  if (!("children" in node)) return;
+  for (const child of (node as ChildrenMixin).children) {
+    const n = child as SceneNode & {
+      flipHorizontal?: boolean;
+      flipVertical?: boolean;
+      assetOnly?: boolean;
+      exportAsAsset?: boolean;
+    };
+    if (!n.assetOnly && !n.exportAsAsset) continue;
+    n.flipHorizontal = false;
+    n.flipVertical = false;
+  }
+}

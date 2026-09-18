@@ -105,6 +105,32 @@ function isDecorativeOrIconGroup(node: SceneNode): boolean {
   return false;
 }
 
+/**
+ * True when the subtree is illustration-only (vectors/shapes/nested groups).
+ * Grain, terrain, and mask artwork must not be packed into tidy row/col wrappers.
+ */
+export function isIllustrationSubtree(node: SceneNode): boolean {
+  if (
+    node.type === "TEXT" ||
+    node.type === "INSTANCE" ||
+    node.type === "COMPONENT" ||
+    node.type === "COMPONENT_SET"
+  ) {
+    return false;
+  }
+  if (isDecorativeLayer(node)) return true;
+  if ((node.type === "GROUP" || node.type === "FRAME") && "children" in node) {
+    const kids = node.children.filter(
+      (c) => c.visible !== false && c.type !== "SLICE",
+    );
+    return (
+      kids.length > 0 &&
+      kids.every((c) => isIllustrationSubtree(c as SceneNode))
+    );
+  }
+  return false;
+}
+
 export function parentHasFills(node: SceneNode): boolean {
   if (!("fills" in node)) return false;
   const fills = (node as MinimalFillsMixin).fills;

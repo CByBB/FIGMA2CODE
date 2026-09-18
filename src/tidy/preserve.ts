@@ -174,6 +174,10 @@ function parentAbsOrigin(parent: BaseNode & ChildrenMixin): {
 /**
  * Replace a GROUP with an equivalent FRAME in-place so it can use
  * layoutPositioning ABSOLUTE inside page Auto Layout.
+ *
+ * Place from AABB vs the *immediate* parent. `group.x`/`group.y` are relative
+ * to the nearest FRAME, not intermediate GROUPs — nesting shells with those
+ * values packs Mask/sun at (0,0) and leaves children in ancestor space.
  */
 export function convertGroupToFrame(group: GroupNode): FrameNode {
   const parent = group.parent;
@@ -183,6 +187,16 @@ export function convertGroupToFrame(group: GroupNode): FrameNode {
 
   const index = parent.children.indexOf(group);
   const groupBox = group.absoluteBoundingBox;
+  const parentBox =
+    "absoluteBoundingBox" in parent ? parent.absoluteBoundingBox : null;
+  // Snapshot before any reparent — group AABB shrinks as children leave.
+  const targetW = Math.max(1, groupBox?.width ?? group.width);
+  const targetH = Math.max(1, groupBox?.height ?? group.height);
+  const targetX = groupBox && parentBox ? groupBox.x - parentBox.x : group.x;
+  const targetY = groupBox && parentBox ? groupBox.y - parentBox.y : group.y;
+  const savedAbs = groupBox
+    ? { x: groupBox.x, y: groupBox.y, w: groupBox.width, h: groupBox.height }
+    : null;
   const children = [...group.children].map((child) => ({
     node: child,
     snap: snapAbs(child),
@@ -190,18 +204,6 @@ export function convertGroupToFrame(group: GroupNode): FrameNode {
 
   const frame = figma.createFrame();
   frame.name = group.name;
-  frame.resizeWithoutConstraints(
-    Math.max(1, groupBox?.width ?? group.width),
-    Math.max(1, groupBox?.height ?? group.height),
-  );
-  const origin = parentAbsOrigin(parent as BaseNode & ChildrenMixin);
-  if (groupBox) {
-    frame.x = groupBox.x - origin.x;
-    frame.y = groupBox.y - origin.y;
-  } else {
-    frame.x = group.x;
-    frame.y = group.y;
-  }
   frame.fills = [];
   frame.clipsContent = false;
 
@@ -212,6 +214,16 @@ export function convertGroupToFrame(group: GroupNode): FrameNode {
   if ("visible" in group) frame.visible = group.visible;
 
   parent.insertChild(index >= 0 ? index : parent.children.length, frame);
+  try {
+    frame.resizeWithoutConstraints(targetW, targetH);
+  } catch (e) {
+    logError(`group→frame resize failed (${safeNodeRef(frame)})`, e);
+  }
+  try {
+    placeLocalBox(frame, targetX, targetY);
+  } catch (e) {
+    logError(`group→frame place failed (${safeNodeRef(frame)})`, e);
+  }
 
   for (const { node, snap } of children) {
     if (!node.parent) continue;
@@ -232,6 +244,34 @@ export function convertGroupToFrame(group: GroupNode): FrameNode {
     if (group.parent) group.remove();
   } catch (e) {
     logError(`group→frame remove failed (${safeNodeRef(group)})`, e);
+  }
+
+  // Re-assert shell to the pre-convert world box (not stale group.x).
+  const parentAbs = parentAbsOrigin(parent);
+  if (savedAbs) {
+    try {
+      frame.resizeWithoutConstraints(
+        Math.max(1, savedAbs.w),
+        Math.max(1, savedAbs.h),
+      );
+      placeLocalBox(frame, savedAbs.x - parentAbs.x, savedAbs.y - parentAbs.y);
+    } catch (e) {
+      logError(`group→frame reassert failed (${safeNodeRef(frame)})`, e);
+    }
+  } else {
+    try {
+      frame.resizeWithoutConstraints(targetW, targetH);
+      placeLocalBox(frame, targetX, targetY);
+    } catch (e) {
+      logError(`group→frame reassert failed (${safeNodeRef(frame)})`, e);
+    }
+  }
+  const frameAbs = frame.absoluteBoundingBox;
+  if (frameAbs) {
+    for (const { node, snap } of children) {
+      if (!snap || !node.parent) continue;
+      placeLocalBox(node, snap.x - frameAbs.x, snap.y - frameAbs.y);
+    }
   }
   return frame;
 }

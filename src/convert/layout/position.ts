@@ -4,6 +4,29 @@ export const getCommonPositionValue = (
   node: SceneNode,
   settings?: HTMLSettings,
 ): { x: number; y: number } => {
+  const rotationDeg =
+    ("rotation" in node && typeof node.rotation === "number"
+      ? node.rotation
+      : 0) +
+    ((node as { cumulativeRotation?: number }).cumulativeRotation || 0);
+  const rotated = Math.abs(rotationDeg) > 0.5;
+
+  // Unrotated: prefer AABB vs parent AABB. After tidy group→frame / wrappers,
+  // JSON_REST_V1 `x`/`y` can stay in an ancestor space while AABB is canvas-true.
+  if (
+    !rotated &&
+    node.parent &&
+    "absoluteBoundingBox" in node.parent &&
+    node.parent.absoluteBoundingBox &&
+    "absoluteBoundingBox" in node &&
+    node.absoluteBoundingBox
+  ) {
+    return {
+      x: node.absoluteBoundingBox.x - node.parent.absoluteBoundingBox.x,
+      y: node.absoluteBoundingBox.y - node.parent.absoluteBoundingBox.y,
+    };
+  }
+
   if (node.parent && node.parent.absoluteBoundingBox) {
     if (settings?.embedVectors && node.svg) {
       // Inlined SVG is positioned from absoluteBoundingBox, not transformed x/y.

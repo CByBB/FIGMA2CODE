@@ -19,7 +19,11 @@ import {
 } from "../media/images";
 import { addWarning } from "../warnings";
 import { getCachedAsset } from "../../export/cache";
-import { getRotationLayoutSlot } from "./blend";
+import {
+  getRotationLayoutSlot,
+  getCssRotationDeg,
+  clearSvgAssetFlips,
+} from "./blend";
 
 // Walk enriched alt-nodes and emit HTML/CSS strings for preview or ZIP index.html.
 const selfClosingTags = ["img"];
@@ -93,6 +97,24 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
   // Plugin API uses POLYGON; REST / enriched alt-nodes may still say REGULAR_POLYGON.
   const cachedSvg = node.id ? getCachedAsset(node.id) : undefined;
   const nodeType = node.type as string;
+  // Flattened illustration (mask groups, vector-heavy clusters) exported as PNG.
+  // Do not swallow image-fill frames that still have child layers.
+  // Use layout AABB (not renderBounds) so left/top match the Figma frame box.
+  if (
+    cachedSvg?.format === "PNG" &&
+    cachedSvg.path &&
+    settings.relativeAssetPaths &&
+    "children" in node &&
+    Array.isArray((node as SceneNode & ChildrenMixin).children) &&
+    (node as SceneNode & ChildrenMixin).children.length > 0 &&
+    (nodeType === "FRAME" ||
+      nodeType === "GROUP" ||
+      nodeType === "COMPONENT" ||
+      nodeType === "INSTANCE") &&
+    !("fills" in node && nodeHasImageFill(node))
+  ) {
+    return htmlWrapCompositePng(node, settings, cachedSvg.path);
+  }
   if (
     settings.embedVectors &&
     cachedSvg?.format === "SVG" &&
@@ -183,9 +205,14 @@ const htmlWrapSVG = (
 };
 
 /**
- * Size/position SVG <img> from absoluteRenderBounds when paint overflows the
+ * Size/position SVG <img> from absoluteRenderBounds when paint *overflows* the
  * layout AABB (LINE strokes, DROP_SHADOW filters). Figma SVG export is already
  * screen-oriented to that box; using AABB alone clips shadows or squashes lines.
+ *
+ * Do NOT use renderBounds when it is smaller than the AABB — that usually means
+ * an ancestor `clipsContent` shrank the visible paint (Hero/Skills red terrain
+ * AABB 1163×402 vs renderBounds 1163×95). Sizing to the clipped box squashes the
+ * full SVG into a flat strip; keep the AABB and let CSS `overflow: hidden` clip.
  */
 const svgFileLayoutNode = (node: SceneNode): SceneNode => {
   const n = node as SceneNode & {
@@ -207,6 +234,15 @@ const svgFileLayoutNode = (node: SceneNode): SceneNode => {
       Math.abs(box.x - aabb.x) < 0.5 &&
       Math.abs(box.y - aabb.y) < 0.5;
     if (sameBox) return node;
+
+    // Ancestor clip: renderBounds is a subset of the layout box.
+    const clippedSubset =
+      box.x >= aabb.x - 0.5 &&
+      box.y >= aabb.y - 0.5 &&
+      box.x + box.width <= aabb.x + aabb.width + 0.5 &&
+      box.y + box.height <= aabb.y + aabb.height + 0.5 &&
+      (box.width < aabb.width - 0.5 || box.height < aabb.height - 0.5);
+    if (clippedSubset) return node;
   }
 
   const parentBox =
@@ -276,20 +312,80 @@ const imageFillLayoutNode = (node: SceneNode): SceneNode => {
   } as SceneNode;
 };
 
+/**
+ * exportAsync SVG is screen-oriented (rotation and flips are in the path,
+ * viewBox is the layout box). CSS rotate()/scale() on top, using the
+ * pre-rotation anchor, swings that art past the section edge — Skills Group 21
+ * cream cliff (514:7598) lands on rotate(180) at left:323 and overflow:hidden
+ * slices it into a vertical cut.
+ * Place the file on the AABB and drop the extra transform.
+ */
+const screenOrientedSvgNode = (node: SceneNode): SceneNode => {
+  const n = node as SceneNode & {
+    flipHorizontal?: boolean;
+    flipVertical?: boolean;
+    cumulativeRotation?: number;
+    absoluteBoundingBox?: Rect | null;
+  };
+  const deg = getCssRotationDeg(n);
+  const flipped = n.flipHorizontal === true || n.flipVertical === true;
+  if (deg === 0 && !flipped) return node;
+
+  const parentBox =
+    node.parent && "absoluteBoundingBox" in node.parent
+      ? (node.parent as { absoluteBoundingBox?: Rect | null })
+          .absoluteBoundingBox
+      : null;
+  const aabb = n.absoluteBoundingBox;
+  return {
+    ...node,
+    rotation: 0,
+    cumulativeRotation: 0,
+    flipHorizontal: false,
+    flipVertical: false,
+    ...(parentBox && aabb
+      ? { x: aabb.x - parentBox.x, y: aabb.y - parentBox.y }
+      : {}),
+  } as SceneNode;
+};
+
 /** ZIP index.html: reference a pre-exported SVG under assets/ rather than inlining. */
 const htmlWrapSVGFile = (
   node: SceneNode,
   settings: HTMLSettings,
   assetPath: string,
 ): string => {
-  const layoutNode = svgFileLayoutNode(node);
+  const layoutNode = screenOrientedSvgNode(svgFileLayoutNode(node));
   const builder = new HtmlDefaultBuilder(layoutNode, settings)
     .addData("svg-wrapper")
     .commonPositionStyles();
 
-  // Flips are emitted with rotation in htmlRotation (single transform).
   const extra = [formatWithJSX("display", false, "block")];
+  const alt =
+    node.type === "TEXT" && "characters" in node
+      ? String((node as TextNode).characters)
+          .replace(/&/g, "&amp;")
+          .replace(/"/g, "&quot;")
+          .replace(/</g, "&lt;")
+      : "";
 
+  return `\n<img${builder.build(extra)} src="${assetPath}" alt="${alt}" />`;
+};
+
+/**
+ * Rasterized frame/group composites must keep the layout AABB. Using
+ * absoluteRenderBounds (overflow) places a huge img at the wrong origin —
+ * e.g. Mask group 519×493 at (584,569) became 1103×1061 at (0,0).
+ */
+const htmlWrapCompositePng = (
+  node: SceneNode,
+  settings: HTMLSettings,
+  assetPath: string,
+): string => {
+  const builder = new HtmlDefaultBuilder(node, settings)
+    .addData("svg-wrapper")
+    .commonPositionStyles();
+  const extra = [formatWithJSX("display", false, "block")];
   return `\n<img${builder.build(extra)} src="${assetPath}" alt="" />`;
 };
 
@@ -301,6 +397,9 @@ const htmlGroup = async (
   if (node.width < 0 || node.height <= 0 || node.children.length === 0) {
     return "";
   }
+
+  // SVG export already contains flips; a CSS scale would double-mirror.
+  clearSvgAssetFlips(node);
 
   // commonPositionStyles must run before child layout (width/height depend on positioning mode).
   const builder = new HtmlDefaultBuilder(node, settings).commonPositionStyles();
@@ -387,6 +486,9 @@ const htmlFrame = async (
   node: SceneNode & BaseFrameMixin,
   settings: HTMLSettings,
 ): Promise<string> => {
+  // Reflection groups (terrain+torii): SVG files already bake the flip.
+  clearSvgAssetFlips(node);
+
   const childrenStr = await htmlWidgetGenerator(node.children, settings);
 
   if (node.layoutMode !== "NONE") {

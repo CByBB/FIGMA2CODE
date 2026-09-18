@@ -9,6 +9,10 @@ import { postBackendMessage } from "../messaging";
 import { EXPORT_TIMEOUT_MS, withTimeout } from "../convert/media/exportAsync";
 import { logError, safeNodeRef } from "../shared/log";
 import { fixSvgLinearGradients } from "../convert/nodes/fixSvgGradients";
+import {
+  prepareWebFontAvailability,
+  textUsesUnavailableFont,
+} from "./googleFonts";
 import { utf8Decode, utf8Encode } from "../shared/utf8";
 
 const VECTOR_TYPES = new Set([
@@ -109,6 +113,7 @@ function shouldExportShapeAsSvg(node: SceneNode): boolean {
 }
 
 function shouldExportTextAsSvg(node: TextNode): boolean {
+  if (textUsesUnavailableFont(node)) return true;
   try {
     const fills = node.fills;
     if (!Array.isArray(fills)) return false;
@@ -166,6 +171,14 @@ function countVectorDescendants(node: SceneNode): {
   return { vector, total, hasText, hasMask };
 }
 
+function hasDirectMaskChild(node: SceneNode): boolean {
+  if (!("children" in node) || node.children.length === 0) return false;
+  return node.children.some(
+    (c) =>
+      "isMask" in c && (c as BlendMixin & { isMask?: boolean }).isMask === true,
+  );
+}
+
 function shouldExportAsRaster(node: SceneNode): boolean {
   if (!("children" in node)) {
     return hasImageFill(node) && !("children" in node);
@@ -177,7 +190,11 @@ function shouldExportAsRaster(node: SceneNode): boolean {
     return true;
   }
   const { vector, total, hasText, hasMask } = countVectorDescendants(node);
-  if (hasText || hasMask) return false;
+  if (hasText) return false;
+  // Reconstructing Figma masks in HTML misses the clip (mask layer painted as
+  // content, siblings unclipped). Flatten illustration mask groups to PNG.
+  if (hasDirectMaskChild(node) && vector >= 1) return true;
+  if (hasMask) return false;
   return vector >= 6 && total > 0 && vector / total >= 0.65;
 }
 
@@ -520,7 +537,11 @@ async function exportNodeBytes(
   }
 
   if (format === "SVG" && node.type === "TEXT") {
-    return trySettings(node, svgAttempts);
+    // Outline glyphs. A <text font-family="…"> SVG still needs the missing face.
+    return trySettings(node, [
+      { format: "SVG", svgOutlineText: true, svgIdAttribute: true },
+      { format: "SVG", svgOutlineText: true },
+    ]);
   }
 
   if (format === "SVG") {
@@ -658,6 +679,7 @@ export async function exportZipAssets(
     percent: 5,
   });
 
+  await prepareWebFontAvailability(roots);
   const document = await serializeRoot(root);
   const targets: Target[] = [];
   for (const r of roots) collectExportTargets(r, targets);

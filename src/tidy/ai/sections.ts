@@ -924,6 +924,13 @@ export function ensurePageVerticalFlow(
     .filter((n) => !flowIds.has(n.id))
     .map((n) => ({
       node: n,
+      snap:
+        "absoluteBoundingBox" in n && n.absoluteBoundingBox
+          ? {
+              x: n.absoluteBoundingBox.x,
+              y: n.absoluteBoundingBox.y,
+            }
+          : null,
       x: "x" in n ? (n as LayoutMixin).x : 0,
       y: "y" in n ? (n as LayoutMixin).y : 0,
     }));
@@ -945,7 +952,7 @@ export function ensurePageVerticalFlow(
     return;
   }
 
-  for (const { node, x, y } of pinned) {
+  for (const { node, snap, x, y } of pinned) {
     try {
       let overlay: SceneNode = node;
       // GROUPs cannot be layoutPositioning ABSOLUTE — they steal vertical flow
@@ -956,7 +963,12 @@ export function ensurePageVerticalFlow(
       if ("layoutPositioning" in overlay) {
         (overlay as FrameNode).layoutPositioning = "ABSOLUTE";
       }
-      if ("x" in overlay) {
+      if (snap) {
+        const pAbs = page.absoluteBoundingBox;
+        if (pAbs && "x" in overlay) {
+          placeLocalBox(overlay, snap.x - pAbs.x, snap.y - pAbs.y);
+        }
+      } else if ("x" in overlay) {
         (overlay as LayoutMixin).x = x;
         (overlay as LayoutMixin).y = y;
       }
@@ -1058,8 +1070,9 @@ function flowPageAsVerticalSections(
  * next section fill in page Auto Layout. Lift those to the page as ABSOLUTE
  * overlays (world position kept) so they can span section boundaries.
  *
- * Do not lift from clipped sections — overflow was never visible, and moving
- * the node would also hide the in-bounds jagged divider under the section fill.
+ * Do not lift from clipped sections — overflow was never visible in Figma, and
+ * lifting (or HTML overflow:visible) paints the full AABB over the hero
+ * (e.g. Skills Group 514:8970 red terrain covering the samurai).
  * Upward overflow stays in the later section (it already paints above the previous).
  */
 export function liftOverflowDecorations(
@@ -1385,14 +1398,15 @@ export async function applyAiSections(
     }
 
     for (const child of band.members) {
-      // Keep transform-local x/y (not AABB). AABB left ≠ node.x when rotated.
-      const prevX = "x" in child ? (child as LayoutMixin).x : 0;
-      const prevY = "y" in child ? (child as LayoutMixin).y : 0;
-
+      // World snap → section-local. Do not subtract section.x from child.x:
+      // GROUP x/y are relative to the nearest FRAME, not the new section parent.
+      const snap = child.absoluteBoundingBox;
       section.appendChild(child);
-      if ("x" in child) {
-        (child as LayoutMixin).x = prevX - section.x;
-        (child as LayoutMixin).y = prevY - section.y;
+      if (snap && "x" in child) {
+        const sAbs = section.absoluteBoundingBox;
+        if (sAbs) {
+          placeLocalBox(child, snap.x - sAbs.x, snap.y - sAbs.y);
+        }
       }
       assignedCount += 1;
     }
