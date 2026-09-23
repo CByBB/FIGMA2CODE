@@ -5,6 +5,7 @@ import { postBackendMessage, postError } from "../messaging";
 import { logError } from "../shared/log";
 import { applyTidyPlan } from "./apply";
 import { createTidyClone } from "./clone";
+import { loadFontsInTree } from "./fonts";
 import { buildTidyPlan } from "./infer";
 import { fixCoveringPaintOrder, stampPaintOrder } from "./preserve";
 import { resolveTidyTarget } from "./target";
@@ -58,6 +59,10 @@ export async function tidySelection(): Promise<SceneNode | null> {
     const target = resolveTidyTarget();
     const cloned = await createTidyClone(target);
     root = cloned.root;
+
+    // Resize/reparent TEXT without loaded fonts can mash Latin glyphs on the
+    // clone (MISSION/VISION). Load before any tidy mutation.
+    await loadFontsInTree(root);
 
     // Drop hidden layers and nodes fully outside a clipping root before vision/AL.
     pruneNonVisibleNodes(root);

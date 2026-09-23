@@ -198,3 +198,59 @@ export const htmlGridChildProps = (node: SceneNode): string[] => {
   }
   return styles;
 };
+
+/**
+ * Cross-axis alignment for Auto Layout children that are not FILL/STRETCH.
+ * Mission/Vision stays 1036px in a 1280 column — without align-self:center the
+ * band hugs the left edge in HTML even when Figma centered it.
+ */
+export const htmlCrossAxisAlign = (
+  node: SceneNode,
+  isJsx: boolean,
+): string[] => {
+  const parent = node.parent;
+  if (
+    !parent ||
+    !("layoutMode" in parent) ||
+    !parent.layoutMode ||
+    parent.layoutMode === "NONE" ||
+    parent.layoutMode === "GRID"
+  ) {
+    return [];
+  }
+
+  const sizingKey =
+    parent.layoutMode === "VERTICAL"
+      ? "layoutSizingHorizontal"
+      : "layoutSizingVertical";
+  const sizing = (node as SceneNode & Record<string, unknown>)[sizingKey];
+  if (sizing === "FILL") return [];
+
+  const childAlign =
+    "layoutAlign" in node
+      ? (node as SceneNode & { layoutAlign?: string }).layoutAlign
+      : undefined;
+  if (childAlign === "STRETCH") return [];
+
+  const parentCounter =
+    "counterAxisAlignItems" in parent
+      ? (parent as SceneNode & { counterAxisAlignItems?: string })
+          .counterAxisAlignItems
+      : undefined;
+
+  const align =
+    childAlign === "CENTER" || childAlign === "MAX" || childAlign === "MIN"
+      ? childAlign
+      : parentCounter === "CENTER" ||
+          parentCounter === "MAX" ||
+          parentCounter === "MIN"
+        ? parentCounter
+        : null;
+
+  if (!align || align === "MIN") return [];
+
+  const css =
+    align === "CENTER" ? "center" : align === "MAX" ? "flex-end" : null;
+  if (!css) return [];
+  return [formatWithJSX("align-self", isJsx, css)];
+};

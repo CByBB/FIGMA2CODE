@@ -13,6 +13,7 @@ import {
   prepareWebFontAvailability,
   textUsesUnavailableFont,
 } from "./googleFonts";
+import { commonLetterSpacing } from "../convert/layout/text";
 import { utf8Decode, utf8Encode } from "../shared/utf8";
 
 const VECTOR_TYPES = new Set([
@@ -112,8 +113,39 @@ function shouldExportShapeAsSvg(node: SceneNode): boolean {
   return hasVisiblePaint(node);
 }
 
+/**
+ * Short tracked Latin labels (MISSION, VISION, PRODUCT, …). Browser webfonts
+ * + letter-spacing + a FIXED box that hugs the Figma AABB can mash glyphs into
+ * an unreadable cluster next to the FILL divider. Outline = Figma's paint.
+ */
+function textNeedsOutlineForTracking(node: TextNode): boolean {
+  try {
+    const chars = String(node.characters || "");
+    if (!chars || chars.includes("\n") || chars.length > 24) return false;
+    // ASCII / common punctuation only — leave CJK body copy as HTML.
+    if (![...chars].every((c) => c.charCodeAt(0) <= 0x7e)) return false;
+    const fontSize = typeof node.fontSize === "number" ? node.fontSize : 0;
+    if (fontSize <= 0) return false;
+    let ls = 0;
+    try {
+      if (node.letterSpacing && node.letterSpacing !== figma.mixed) {
+        ls = commonLetterSpacing(
+          node.letterSpacing as LetterSpacing | number,
+          fontSize,
+        );
+      }
+    } catch {
+      return false;
+    }
+    return Math.abs(ls) >= 0.5;
+  } catch {
+    return false;
+  }
+}
+
 function shouldExportTextAsSvg(node: TextNode): boolean {
   if (textUsesUnavailableFont(node)) return true;
+  if (textNeedsOutlineForTracking(node)) return true;
   try {
     const fills = node.fills;
     if (!Array.isArray(fills)) return false;

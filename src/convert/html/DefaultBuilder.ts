@@ -11,7 +11,7 @@ import { buildBackgroundValues, htmlColorFromFills } from "./color";
 import { htmlPadding } from "./padding";
 import { htmlSizePartial } from "./size";
 import { htmlBorderRadius } from "./borderRadius";
-import { htmlGridChildProps } from "./autoLayout";
+import { htmlGridChildProps, htmlCrossAxisAlign } from "./autoLayout";
 import {
   commonIsAbsolutePosition,
   getCommonPositionValue,
@@ -254,6 +254,9 @@ export class HtmlDefaultBuilder {
       ) {
         this.addStyles(formatWithJSX("flex-shrink", isJSX, "0"));
       }
+
+      // FIXED inset bands (Mission/Vision) need align-self:center in a column.
+      this.addStyles(...htmlCrossAxisAlign(node, isJSX));
     }
 
     return this;

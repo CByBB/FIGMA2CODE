@@ -21,6 +21,16 @@ import { tidyWarn } from "../warnings";
 
 /** Near full-bleed page child — already a section shell, not a card. */
 const SECTION_WIDTH_RATIO = 0.8;
+/** Stretch only when already essentially page-wide; inset grids keep width. */
+const SECTION_FULL_BLEED_RATIO = 0.95;
+/**
+ * Keep designer whitespace between section shells (test4 Hero→Mission /
+ * Mission→CEO ≈100px of page background). Smaller gaps are treated as
+ * rounding and still collapse.
+ */
+const SECTION_GAP_KEEP_PX = 24;
+/** PluginData on transparent spacer frames inserted for SECTION_GAP_KEEP_PX. */
+const TIDY_SECTION_GAP_KEY = "tidy.sectionGap";
 
 export type AppliedAiSectionsStats = {
   sectionCount: number;
@@ -42,9 +52,121 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
+function isSectionGapSpacer(node: SceneNode): boolean {
+  return (
+    "getPluginData" in node &&
+    typeof (node as FrameNode).getPluginData === "function" &&
+    (node as FrameNode).getPluginData(TIDY_SECTION_GAP_KEY) === "1"
+  );
+}
+
+/**
+ * Vertical gaps between consecutive band *content* from the clone's current
+ * absolute positions (before reparent/resize). AI bands are often contiguous
+ * even when the design leaves ~100px of page background between shells.
+ */
+function measureBandContentGaps(
+  bands: BandMembers[],
+  root: SceneNode,
+): number[] {
+  const gaps: number[] = [];
+  for (let i = 0; i < bands.length - 1; i++) {
+    let upperBottom = -Infinity;
+    let lowerTop = Infinity;
+    for (const m of bands[i].members) {
+      const r = childRootRect(m, root);
+      if (r) upperBottom = Math.max(upperBottom, r.y + r.height);
+    }
+    for (const m of bands[i + 1].members) {
+      const r = childRootRect(m, root);
+      if (r) lowerTop = Math.min(lowerTop, r.y);
+    }
+    if (!Number.isFinite(upperBottom) || !Number.isFinite(lowerTop)) {
+      gaps.push(0);
+      continue;
+    }
+    gaps.push(lowerTop - upperBottom);
+  }
+  return gaps;
+}
+
+function createSectionGapSpacer(page: FrameNode, height: number): FrameNode {
+  const h = Math.max(1, Math.round(height * 100) / 100);
+  const spacer = figma.createFrame();
+  spacer.name = "Section Gap";
+  spacer.fills = [];
+  spacer.strokes = [];
+  spacer.clipsContent = false;
+  spacer.resizeWithoutConstraints(Math.max(1, page.width), h);
+  try {
+    spacer.setPluginData(TIDY_SECTION_GAP_KEY, "1");
+  } catch {
+    /* pluginData unavailable */
+  }
+  return spacer;
+}
+
+/**
+ * Insert transparent full-bleed spacers between flow sections so page Auto
+ * Layout keeps designer whitespace (page background showing through).
+ */
+function interleaveSectionGapSpacers(
+  page: FrameNode,
+  sections: FrameNode[],
+  gaps: number[],
+): FrameNode[] {
+  if (sections.length === 0 || gaps.length === 0) return sections;
+  const out: FrameNode[] = [];
+  for (let i = 0; i < sections.length; i++) {
+    out.push(sections[i]);
+    const gap = i < gaps.length ? gaps[i] : 0;
+    if (gap < SECTION_GAP_KEEP_PX) continue;
+    const spacer = createSectionGapSpacer(page, gap);
+    try {
+      const at = page.children.indexOf(sections[i]);
+      if (at >= 0) page.insertChild(at + 1, spacer);
+      else page.appendChild(spacer);
+    } catch (e) {
+      logError(`section gap spacer insert failed`, e);
+      try {
+        spacer.remove();
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
+    out.push(spacer);
+  }
+  return out;
+}
+
+function resizePageToFitFlow(page: FrameNode): void {
+  let total = 0;
+  for (const child of page.children) {
+    if (child.visible === false) continue;
+    if (
+      "layoutPositioning" in child &&
+      (child as FrameNode).layoutPositioning === "ABSOLUTE"
+    ) {
+      continue;
+    }
+    if ("height" in child) total += Math.max(0, child.height);
+  }
+  if (total < 1) return;
+  const next = Math.round(total * 100) / 100;
+  if (Math.abs(page.height - next) < 0.5) return;
+  try {
+    page.resizeWithoutConstraints(Math.max(1, page.width), Math.max(1, next));
+  } catch (e) {
+    logError(`page resize-to-fit failed (${safeNodeRef(page)})`, e);
+  }
+}
+
 /**
  * Force section bands to abut: band[i].yEnd === band[i+1].yStart, covering [0, rootHeight].
  * AI often returns slight gaps/overlaps; those become visible holes between section frames.
+ * Large intentional gaps are preserved later via measureBandContentGaps spacers — this
+ * only closes sub-SECTION_GAP_KEEP_PX noise in the AI band edges.
  */
 function normalizeContiguousBands(
   bands: Array<{ name: string; yStart: number; yEnd: number }>,
@@ -940,7 +1062,11 @@ export function ensurePageVerticalFlow(
     page.primaryAxisSizingMode = "FIXED";
     page.counterAxisSizingMode = "FIXED";
     page.primaryAxisAlignItems = "MIN";
-    page.counterAxisAlignItems = "MIN";
+    // CENTER so inset FIXED sections (Mission/Vision 1036, CompanyProfile 1100)
+    // sit in the middle. Full-bleed children use layoutAlign STRETCH and still
+    // fill the page width. Child layoutAlign CENTER often reverts to INHERIT on
+    // GRID frames — parent counter-axis is the reliable lever.
+    page.counterAxisAlignItems = "CENTER";
     page.paddingTop = 0;
     page.paddingBottom = 0;
     page.paddingLeft = 0;
@@ -989,12 +1115,104 @@ export function ensurePageVerticalFlow(
       if ("layoutPositioning" in section) {
         section.layoutPositioning = "AUTO";
       }
-      section.layoutAlign = "STRETCH";
       section.layoutGrow = 0;
-      section.layoutSizingHorizontal = "FILL";
       section.layoutSizingVertical = "FIXED";
+      if (isSectionGapSpacer(section)) {
+        // Full-bleed transparent band — page background shows through.
+        section.layoutAlign = "STRETCH";
+        section.layoutSizingHorizontal = "FILL";
+        continue;
+      }
+      const nearlyFull = section.width >= page.width * SECTION_FULL_BLEED_RATIO;
+      if (nearlyFull) {
+        section.layoutAlign = "STRETCH";
+        section.layoutSizingHorizontal = "FILL";
+      } else {
+        section.layoutAlign = "CENTER";
+        section.layoutSizingHorizontal = "FIXED";
+      }
     } catch (e) {
       logError(`section flow sizing failed (${safeNodeRef(section)})`, e);
+    }
+  }
+
+  // GRID/FIXED children often ignore layoutAlign CENTER (stays INHERIT → x=0).
+  // Wrap inset sections in a full-bleed transparent row that centers them.
+  const contentSections = sections.filter((s) => !isSectionGapSpacer(s));
+  wrapInsetSectionsInCenterBands(page, contentSections);
+  resizePageToFitFlow(page);
+}
+
+/**
+ * Mission/Vision (1036) and CompanyProfile (1100) must stay inset and centered.
+ * Setting layoutAlign/counterAxisAlignItems alone leaves them at x=0 on GRID
+ * shells. A full-width HORIZONTAL band with primaryAxisAlignItems CENTER is
+ * reliable in Figma and converts to `justify-content: center` in HTML.
+ */
+function wrapInsetSectionsInCenterBands(
+  page: FrameNode,
+  sections: FrameNode[],
+): void {
+  const pageW = page.width;
+  for (const section of [...sections]) {
+    try {
+      if (section.parent !== page) continue;
+      if (section.width >= pageW * SECTION_FULL_BLEED_RATIO) continue;
+      if (
+        "layoutPositioning" in section &&
+        section.layoutPositioning === "ABSOLUTE"
+      ) {
+        continue;
+      }
+
+      const w = section.width;
+      const h = Math.max(1, section.height);
+      const shell = figma.createFrame();
+      shell.name = section.name;
+      shell.fills = [];
+      shell.strokes = [];
+      shell.clipsContent = false;
+      shell.resizeWithoutConstraints(Math.max(1, pageW), h);
+      shell.layoutMode = "HORIZONTAL";
+      shell.primaryAxisAlignItems = "CENTER";
+      shell.counterAxisAlignItems = "MIN";
+      shell.primaryAxisSizingMode = "FIXED";
+      shell.counterAxisSizingMode = "FIXED";
+      shell.paddingLeft = 0;
+      shell.paddingRight = 0;
+      shell.paddingTop = 0;
+      shell.paddingBottom = 0;
+      shell.itemSpacing = 0;
+      if ("layoutWrap" in shell) shell.layoutWrap = "NO_WRAP";
+
+      const at = page.children.indexOf(section);
+      if (at < 0) {
+        shell.remove();
+        continue;
+      }
+      page.insertChild(at, shell);
+      shell.appendChild(section);
+
+      section.name = `${section.name} Content`;
+      if ("layoutPositioning" in section) {
+        section.layoutPositioning = "AUTO";
+      }
+      section.layoutSizingHorizontal = "FIXED";
+      section.layoutSizingVertical = "FIXED";
+      section.layoutAlign = "INHERIT";
+      section.layoutGrow = 0;
+      try {
+        section.resize(Math.max(1, w), Math.max(1, h));
+      } catch (e) {
+        logError(`inset content resize failed (${safeNodeRef(section)})`, e);
+      }
+
+      shell.layoutAlign = "STRETCH";
+      shell.layoutSizingHorizontal = "FILL";
+      shell.layoutSizingVertical = "FIXED";
+      shell.layoutGrow = 0;
+    } catch (e) {
+      logError(`inset center band wrap failed (${safeNodeRef(section)})`, e);
     }
   }
 }
@@ -1213,12 +1431,19 @@ function normalizePromotedSection(
   const bandH = Math.max(1, band.yEnd - band.yStart);
   const prevX = section.x;
   const prevY = section.y;
+  const prevW = section.width;
+  // Reused shells between SECTION_WIDTH_RATIO and full bleed (e.g. Mission/Vision
+  // 1036px in a 1280 page) must keep their inset width. Forcing pageWidth grows
+  // GRID FILL children (517→639 cards) and removes the side margins that frame
+  // the white cards against the page background.
+  const keepInset = prevW > 0 && prevW < pageWidth * SECTION_FULL_BLEED_RATIO;
+  const targetW = keepInset ? Math.max(1, prevW) : Math.max(1, pageWidth);
   try {
-    section.resizeWithoutConstraints(Math.max(1, pageWidth), bandH);
+    section.resizeWithoutConstraints(targetW, bandH);
   } catch (e) {
     logError(`promote section resize failed (${safeNodeRef(section)})`, e);
   }
-  section.x = 0;
+  section.x = keepInset ? Math.round((pageWidth - targetW) / 2) : 0;
   section.y = band.yStart;
   const dx = prevX - section.x;
   const dy = prevY - section.y;
@@ -1358,6 +1583,9 @@ export async function applyAiSections(
     childOrder,
   );
 
+  // Capture designer whitespace BEFORE reparent/resize moves shells flush.
+  const sectionGaps = measureBandContentGaps(filledBands, root);
+
   const sectionNodes: FrameNode[] = [];
 
   for (const band of filledBands) {
@@ -1412,7 +1640,12 @@ export async function applyAiSections(
     }
   }
 
-  flowPageAsVerticalSections(frame, sectionNodes, unassigned);
+  const flowedSections = interleaveSectionGapSpacers(
+    frame,
+    sectionNodes,
+    sectionGaps,
+  );
+  flowPageAsVerticalSections(frame, flowedSections, unassigned);
 
   const renameStats = await applyRenamesAsync(result.renames);
   // Band names win over layer renames on section roots (reuse would otherwise

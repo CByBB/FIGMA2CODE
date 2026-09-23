@@ -85,6 +85,7 @@ function pinFixedSize(node: SceneNode, w: number, h: number): void {
     n.layoutAlign = "INHERIT";
     // AABB size ≠ layout size when rotated — resizing to the box grows the node.
     // Zero-width/height lines must not be forced to 1px (that alone fails pixel checks).
+    // TEXT resize needs fonts loaded; skip no-op resizes to avoid glyph churn.
     if (
       "resize" in n &&
       !isRotatable(n) &&
@@ -92,7 +93,11 @@ function pinFixedSize(node: SceneNode, w: number, h: number): void {
       w >= 0.5 &&
       h >= 0.5
     ) {
-      (n as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
+      const curW = "width" in node ? Math.abs(node.width) : w;
+      const curH = "height" in node ? Math.abs(node.height) : h;
+      if (Math.abs(curW - w) > 0.5 || Math.abs(curH - h) > 0.5) {
+        (n as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
+      }
     }
   } catch (e) {
     logError(`layout sizing write failed (${safeNodeRef(n)})`, e);

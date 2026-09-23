@@ -143,10 +143,14 @@ export function placeLocalBox(
     w >= 0.5 &&
     h >= 0.5
   ) {
-    try {
-      (node as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
-    } catch (e) {
-      logError(`resize failed (${safeNodeRef(node)})`, e);
+    const curW = Math.abs(node.width);
+    const curH = Math.abs(node.height);
+    if (Math.abs(curW - w) > 0.5 || Math.abs(curH - h) > 0.5) {
+      try {
+        (node as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
+      } catch (e) {
+        logError(`resize failed (${safeNodeRef(node)})`, e);
+      }
     }
   }
   const { dx, dy } = transformOriginOffset(node);

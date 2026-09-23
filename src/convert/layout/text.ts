@@ -1,7 +1,12 @@
 export const commonLineHeight = (
-  lineHeight: LineHeight,
+  lineHeight: LineHeight | number,
   fontSize: number,
 ): number => {
+  // REST / Object.assign(style) often leaves a bare px number, not { unit, value }.
+  if (typeof lineHeight === "number" && Number.isFinite(lineHeight)) {
+    return lineHeight;
+  }
+  if (!lineHeight || typeof lineHeight !== "object") return 0;
   switch (lineHeight.unit) {
     case "AUTO":
       return 0;
@@ -9,18 +14,29 @@ export const commonLineHeight = (
       return lineHeight.value;
     case "PERCENT":
       return (fontSize * lineHeight.value) / 100;
+    default:
+      return 0;
   }
 };
 
 export const commonLetterSpacing = (
-  letterSpacing: LetterSpacing,
+  letterSpacing: LetterSpacing | number,
   fontSize: number,
 ): number => {
+  // REST style.letterSpacing is a bare number (px). Treating it as LetterSpacing
+  // makes `.unit` undefined so spacing is dropped — tracked labels like MISSION
+  // (1.4px) then overflow their FIXED box and smear into the adjacent divider.
+  if (typeof letterSpacing === "number" && Number.isFinite(letterSpacing)) {
+    return letterSpacing;
+  }
+  if (!letterSpacing || typeof letterSpacing !== "object") return 0;
   switch (letterSpacing.unit) {
     case "PIXELS":
       return letterSpacing.value;
     case "PERCENT":
       return (fontSize * letterSpacing.value) / 100;
+    default:
+      return 0;
   }
 };
 

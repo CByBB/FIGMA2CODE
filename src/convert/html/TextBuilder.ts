@@ -140,7 +140,7 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
         {
           color: htmlColorFromFills(segment.fills as any),
           "font-size": segment.fontSize,
-          "font-family": segment.fontName.family,
+          "font-family": `"${String(segment.fontName.family).replace(/"/g, "")}"`,
           "font-style": this.getFontStyle(segment.fontName.style),
           "font-weight": `${segment.fontWeight}`,
           "text-decoration": this.textDecoration(segment.textDecoration),
@@ -227,15 +227,18 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
     }
   }
 
-  letterSpacing(letterSpacing: LetterSpacing, fontSize: number): number | null {
+  letterSpacing(
+    letterSpacing: LetterSpacing | number,
+    fontSize: number,
+  ): number | null {
     const letterSpacingProp = commonLetterSpacing(letterSpacing, fontSize);
-    if (letterSpacingProp > 0) {
+    if (letterSpacingProp !== 0 && Number.isFinite(letterSpacingProp)) {
       return letterSpacingProp;
     }
     return null;
   }
 
-  lineHeight(lineHeight: LineHeight, fontSize: number): number | null {
+  lineHeight(lineHeight: LineHeight | number, fontSize: number): number | null {
     const lineHeightProp = commonLineHeight(lineHeight, fontSize);
     if (lineHeightProp > 0) {
       return lineHeightProp;

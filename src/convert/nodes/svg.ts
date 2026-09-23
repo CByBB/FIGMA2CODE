@@ -79,9 +79,14 @@ export const renderAndAttachSVG = async (node: any) => {
     }
 
     try {
-      const svg = (await exportAsyncProxy<string>(node, {
-        format: "SVG_STRING",
-      })) as string;
+      // TEXT without outline keeps <text font-family="…"> — browser may miss the
+      // face or mash tracked labels. Always outline when flattening text to SVG.
+      const svg = (await exportAsyncProxy<string>(
+        node,
+        node.type === "TEXT"
+          ? { format: "SVG_STRING", svgOutlineText: true }
+          : { format: "SVG_STRING" },
+      )) as string;
 
       if (node.colorVariableMappings && node.colorVariableMappings.size > 0) {
         let processedSvg = svg;
