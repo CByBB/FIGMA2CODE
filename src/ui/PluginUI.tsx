@@ -1,3 +1,4 @@
+/** Main plugin panel layout: code preview, palettes, warnings, and About settings. */
 import copy from "copy-to-clipboard";
 import GradientsPanel from "./components/GradientsPanel";
 import ColorsPanel from "./components/ColorsPanel";
@@ -18,6 +19,7 @@ import React from "react";
 import { Button } from "./primitives/button";
 import { ScrollArea } from "./primitives/scroll-area";
 import { TooltipProvider } from "./primitives/tooltip";
+import type { PreviewMode } from "./components/CodePanel";
 
 type PluginUIProps = {
   code: string;
@@ -34,12 +36,21 @@ type PluginUIProps = {
   isLoading: boolean;
   isZipExporting?: boolean;
   isTidying?: boolean;
+  hasOpenRouterKey?: boolean;
   statusMessage?: string;
   progressPercent?: number | null;
   onDownloadZip?: () => void;
   onTidyAndConvert?: () => void;
-  onCopyFullCode?: () => void;
-  onShowFullCode?: () => void;
+  onSaveOpenRouterKey?: (key: string) => void;
+  onClearOpenRouterKey?: () => void;
+  previewMode: PreviewMode;
+  figmaJson: string;
+  jsonLineCount: number;
+  showingFullJson: boolean;
+  figmaJsonLoading: boolean;
+  onPreviewModeChange?: (mode: PreviewMode) => void;
+  onCopy?: () => void;
+  onShowMore?: () => void;
 };
 
 const LOADING_INDICATOR_DELAY_MS = 250;
@@ -50,6 +61,7 @@ const ZipToolbar = ({
   isLoading,
   isZipExporting,
   isTidying,
+  hasOpenRouterKey,
   canDownloadZip,
   onDownloadZip,
   onTidyAndConvert,
@@ -59,6 +71,7 @@ const ZipToolbar = ({
   isLoading: boolean;
   isZipExporting: boolean;
   isTidying: boolean;
+  hasOpenRouterKey: boolean;
   canDownloadZip: boolean;
   onDownloadZip?: () => void;
   onTidyAndConvert?: () => void;
@@ -76,14 +89,21 @@ const ZipToolbar = ({
           {statusMessage ||
             (canDownloadZip
               ? "Download ZIP for index.html + assets"
-              : "Select a frame, or Tidy + Convert for the page")}
+              : hasOpenRouterKey
+                ? "Select a frame, or Tidy + Convert for the page"
+                : "Add OpenRouter API key in About to enable Tidy + Convert")}
         </p>
         <div className="flex shrink-0 items-center gap-1.5">
           <Button
             size="sm"
             variant="outline"
             className="h-8"
-            disabled={busy || !onTidyAndConvert}
+            disabled={busy || !onTidyAndConvert || !hasOpenRouterKey}
+            title={
+              hasOpenRouterKey
+                ? "Clone, AI-section, Auto Layout, then convert"
+                : "Save an OpenRouter API key in About first"
+            }
             onClick={() => onTidyAndConvert?.()}
           >
             {isTidying ? "Tidying…" : "Tidy + Convert"}
@@ -184,7 +204,10 @@ export const PluginUI = (props: PluginUIProps) => {
           {showAbout ? (
             <About
               useOldPluginVersion={props.settings?.useOldPluginVersion2025}
+              hasOpenRouterKey={Boolean(props.hasOpenRouterKey)}
               onPreferenceChanged={props.onPreferenceChanged}
+              onSaveOpenRouterKey={props.onSaveOpenRouterKey}
+              onClearOpenRouterKey={props.onClearOpenRouterKey}
             />
           ) : (
             <div className="flex flex-col items-center px-4 pt-3 pb-2 gap-2 dark:bg-transparent min-h-full">
@@ -194,6 +217,7 @@ export const PluginUI = (props: PluginUIProps) => {
                 isLoading={props.isLoading}
                 isZipExporting={Boolean(props.isZipExporting)}
                 isTidying={Boolean(props.isTidying)}
+                hasOpenRouterKey={Boolean(props.hasOpenRouterKey)}
                 canDownloadZip={canDownloadZip}
                 onDownloadZip={props.onDownloadZip}
                 onTidyAndConvert={props.onTidyAndConvert}
@@ -218,8 +242,14 @@ export const PluginUI = (props: PluginUIProps) => {
                     code={props.code}
                     lineCount={props.lineCount}
                     showingFullCode={props.showingFullCode}
-                    onCopyFullCode={props.onCopyFullCode}
-                    onShowFullCode={props.onShowFullCode}
+                    previewMode={props.previewMode}
+                    figmaJson={props.figmaJson}
+                    jsonLineCount={props.jsonLineCount}
+                    showingFullJson={props.showingFullJson}
+                    figmaJsonLoading={props.figmaJsonLoading}
+                    onPreviewModeChange={props.onPreviewModeChange}
+                    onCopy={props.onCopy}
+                    onShowMore={props.onShowMore}
                   />
 
                   {props.colors.length > 0 && (

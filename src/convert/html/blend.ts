@@ -1,20 +1,12 @@
 import { numberToFixedString } from "../css/numbers";
 import { formatWithJSX } from "../css/format";
-import { RestAltNode } from "types";
 
-/**
- * https://tailwindcss.com/docs/opacity/
- * default is [0, 25, 50, 75, 100], but '100' will be ignored:
- * if opacity was changed, let it be visible. Therefore, 98% => 75
- * node.opacity is between [0, 1]; output will be [0, 100]
- */
+/** Node opacity [0,1] → CSS opacity when not fully opaque. */
 export const htmlOpacity = (
   node: MinimalBlendMixin,
   isJsx: boolean,
 ): string => {
-  // [when testing] node.opacity can be undefined
   if (node.opacity !== undefined && node.opacity !== 1) {
-    // formatWithJSX is not called here because opacity unit doesn't end in px.
     if (isJsx) {
       return `opacity: ${numberToFixedString(node.opacity)}`;
     } else {
@@ -86,18 +78,13 @@ export const htmlBlendMode = (
 };
 
 /**
- * https://tailwindcss.com/docs/visibility/
- * example: invisible
+ * Hidden layers are skipped in generate/toJson; this is a last-resort guard if
+ * one still reaches the style builder.
  */
 export const htmlVisibility = (
   node: SceneNodeMixin,
   isJsx: boolean,
 ): string => {
-  // [when testing] node.visible can be undefined
-
-  // When something is invisible in Figma, it isn't gone. Groups can make use of it.
-  // Therefore, instead of changing the visibility (which causes bugs in nested divs),
-  // this plugin is going to ignore color and stroke
   if (node.visible !== undefined && !node.visible) {
     return formatWithJSX("visibility", isJsx, "hidden");
   }
@@ -105,23 +92,134 @@ export const htmlVisibility = (
 };
 
 /**
- * https://tailwindcss.com/docs/rotate/
- * default is [-180, -90, -45, 0, 45, 90, 180], but '0' will be ignored:
- * if rotation was changed, let it be perceived. Therefore, 1 => 45
+ * CSS transform for layout rotation plus asset flips.
+ * Rotate and scale must be one `transform` — a second `transform:` overrides the first.
+ *
+ * Do not combine CSS flips with rotation when using transform-origin top left:
+ * rotate(180) + scale(-1,1) shifts the visual AABB (News dog landed 119px right
+ * and mirrored). Figma's rotation already places the bitmap; flips alone are OK.
  */
-export const htmlRotation = (node: RestAltNode, isJsx: boolean): string[] => {
-  const rotation =
-    -Math.round((node.rotation || 0) + (node.cumulativeRotation || 0)) || 0;
-
-  if (rotation !== 0) {
-    return [
-      formatWithJSX(
-        "transform",
-        isJsx,
-        `rotate(${numberToFixedString(rotation)}deg)`,
-      ),
-      formatWithJSX("transform-origin", isJsx, "top left"),
-    ];
-  }
-  return [];
+export const getCssRotationDeg = (node: SceneNode): number => {
+  const extra = node as SceneNode & { cumulativeRotation?: number };
+  const baseRotation =
+    "rotation" in node && typeof (node as LayoutMixin).rotation === "number"
+      ? (node as LayoutMixin).rotation
+      : 0;
+  return -Math.round(baseRotation + (extra.cumulativeRotation || 0)) || 0;
 };
+
+/**
+ * In-flow Auto Layout uses the axis-aligned box; CSS width/height are the
+ * pre-rotation box. Without a slot, HUG parents size to ~58px for a 16px-tall
+ * vertical FEATURE label and the rotate origin is wrong.
+ */
+export const getRotationLayoutSlot = (
+  node: SceneNode,
+): {
+  width: number;
+  height: number;
+  innerLeft: number;
+  innerTop: number;
+} | null => {
+  if (getCssRotationDeg(node) === 0) return null;
+
+  const parent = node.parent;
+  if (
+    !parent ||
+    !("layoutMode" in parent) ||
+    !parent.layoutMode ||
+    parent.layoutMode === "NONE"
+  ) {
+    return null;
+  }
+
+  // Absolutely positioned nodes already place via left/top from toJson.
+  if (
+    "layoutPositioning" in node &&
+    (node as SceneNode & { layoutPositioning?: string }).layoutPositioning ===
+      "ABSOLUTE"
+  ) {
+    return null;
+  }
+
+  const aabb =
+    "absoluteBoundingBox" in node
+      ? (node as LayoutMixin & { absoluteBoundingBox?: Rect | null })
+          .absoluteBoundingBox
+      : null;
+  const parentBox =
+    "absoluteBoundingBox" in parent
+      ? (parent as { absoluteBoundingBox?: Rect | null }).absoluteBoundingBox
+      : null;
+  if (!aabb || !parentBox) return null;
+
+  const aabbRelX = aabb.x - parentBox.x;
+  const aabbRelY = aabb.y - parentBox.y;
+  const nodeX = typeof node.x === "number" ? node.x : aabbRelX;
+  const nodeY = typeof node.y === "number" ? node.y : aabbRelY;
+
+  return {
+    width: Math.max(1, aabb.width || 0),
+    height: Math.max(1, aabb.height || 0),
+    innerLeft: nodeX - aabbRelX,
+    innerTop: nodeY - aabbRelY,
+  };
+};
+
+export const htmlRotation = (node: SceneNode, isJsx: boolean): string[] => {
+  const extra = node as SceneNode & {
+    flipHorizontal?: boolean;
+    flipVertical?: boolean;
+  };
+  const rotation = getCssRotationDeg(node);
+  let sx = extra.flipHorizontal ? -1 : 1;
+  let sy = extra.flipVertical ? -1 : 1;
+  if (rotation !== 0) {
+    sx = 1;
+    sy = 1;
+  }
+
+  const parts: string[] = [];
+  if (rotation !== 0) {
+    parts.push(`rotate(${numberToFixedString(rotation)}deg)`);
+  }
+  if (sx !== 1 || sy !== 1) {
+    parts.push(`scale(${sx}, ${sy})`);
+  }
+  if (parts.length === 0) return [];
+
+  const styles = [formatWithJSX("transform", isJsx, parts.join(" "))];
+  // Flips must pivot on the layout box center (Figma flip); `top left` is only
+  // for rotate()-based positioning. Wrong origin shifts reflection ink across
+  // the Hero/Skills seam.
+  if (rotation !== 0) {
+    styles.push(formatWithJSX("transform-origin", isJsx, "top left"));
+  } else if (sx !== 1 || sy !== 1) {
+    styles.push(formatWithJSX("transform-origin", isJsx, "center center"));
+  }
+  return styles;
+};
+
+/**
+ * Figma `exportAsync({format:"SVG"})` already bakes node flips into the path
+ * (Skills 514:7601 is a vertical mirror of Hero 514:8807 inside the same
+ * viewBox). HTML must NOT apply `scale(1,-1)` on top of that file — doing so
+ * around each child's box center splits terrain from torii at the section seam.
+ *
+ * Clear flip flags on SVG-file children so htmlRotation does not double-flip.
+ * Shared-flip hoisting is the same bug: the flip is already in the asset.
+ */
+export function clearSvgAssetFlips(node: SceneNode): void {
+  if (!("children" in node)) return;
+  for (const child of (node as ChildrenMixin).children) {
+    const n = child as SceneNode & {
+      flipHorizontal?: boolean;
+      flipVertical?: boolean;
+      assetOnly?: boolean;
+      exportAsAsset?: boolean;
+    };
+    if (!n.assetOnly && !n.exportAsAsset) continue;
+    n.flipHorizontal = false;
+    n.flipVertical = false;
+  }
+}

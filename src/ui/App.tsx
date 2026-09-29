@@ -1,3 +1,8 @@
+/**
+ * Plugin UI root: listens for main-thread postMessage events, assembles ZIP
+ * downloads from streamed files, and forwards user actions (settings, export,
+ * tidy, OpenRouter key) back to plugin.ts.
+ */
 import { useEffect, useRef, useState } from "react";
 import { PluginUI } from "./PluginUI";
 import { coerceIncomingBytes, downloadZipFromFiles } from "./zip";
@@ -15,9 +20,18 @@ import {
   ZipFileMessage,
   ZipErrorMessage,
   FullCodeMessage,
+  OpenRouterKeyStatusMessage,
+  SelectionJsonMessage,
 } from "types";
 import { postUISettingsChangingMessage } from "./messaging";
 import copy from "copy-to-clipboard";
+import { logError } from "../shared/log";
+import type { PreviewMode } from "./components/CodePanel";
+import {
+  clearOpenRouterKeyBackup,
+  readOpenRouterKeyBackup,
+  writeOpenRouterKeyBackup,
+} from "./openRouterKeyBackup";
 
 interface AppState {
   codePreview: string;
@@ -28,12 +42,18 @@ interface AppState {
   isLoading: boolean;
   isZipExporting: boolean;
   isTidying: boolean;
+  hasOpenRouterKey: boolean;
   settings: PluginSettings | null;
   colors: SolidColorConversion[];
   gradients: LinearGradientConversion[];
   warnings: Warning[];
   statusMessage: string;
   progressPercent: number | null;
+  previewMode: PreviewMode;
+  figmaJson: string;
+  jsonLineCount: number;
+  showingFullJson: boolean;
+  figmaJsonLoading: boolean;
 }
 
 const isDarkFigmaBackground = (background: string) => {
@@ -50,6 +70,9 @@ const isDarkFigmaBackground = (background: string) => {
 
 export default function App() {
   const zipFilesRef = useRef<Map<string, Uint8Array>>(new Map());
+  const previewModeRef = useRef<PreviewMode>("code");
+  /** Avoid re-pushing the same localStorage backup in a loop if main rejects it. */
+  const keyRestoreAttemptedRef = useRef(false);
   const [state, setState] = useState<AppState>({
     codePreview: "",
     lineCount: 0,
@@ -59,12 +82,18 @@ export default function App() {
     isLoading: false,
     isZipExporting: false,
     isTidying: false,
+    hasOpenRouterKey: false,
     settings: null,
     colors: [],
     gradients: [],
     warnings: [],
     statusMessage: "Select a frame to generate code",
     progressPercent: null,
+    previewMode: "code",
+    figmaJson: "",
+    jsonLineCount: 0,
+    showingFullJson: false,
+    figmaJsonLoading: false,
   });
 
   const rootStyles = getComputedStyle(document.documentElement);
@@ -76,10 +105,6 @@ export default function App() {
     window.onmessage = (event: MessageEvent) => {
       const untypedMessage = event.data.pluginMessage as Message;
       if (!untypedMessage?.type) return;
-
-      if (untypedMessage.type !== "zipFile" && untypedMessage.type !== "code") {
-        console.log("[ui] message:", untypedMessage.type);
-      }
 
       switch (untypedMessage.type) {
         case "conversionStart":
@@ -96,6 +121,10 @@ export default function App() {
             isLoading: true,
             isZipExporting: false,
             isTidying: false,
+            figmaJson: "",
+            jsonLineCount: 0,
+            showingFullJson: false,
+            figmaJsonLoading: previewModeRef.current === "json",
           }));
           break;
 
@@ -127,7 +156,23 @@ export default function App() {
             isLoading: false,
             isZipExporting: false,
             isTidying: false,
+            figmaJson: "",
+            jsonLineCount: 0,
+            showingFullJson: false,
+            figmaJsonLoading: previewModeRef.current === "json",
           }));
+          if (previewModeRef.current === "json") {
+            parent.postMessage(
+              {
+                pluginMessage: {
+                  type: "get-selection-json",
+                  purpose: "display",
+                  source: "panel",
+                },
+              },
+              "*",
+            );
+          }
           break;
         }
 
@@ -161,8 +206,8 @@ export default function App() {
           }));
           try {
             downloadZipFromFiles(done.folder, files);
-          } catch (err) {
-            console.error("[ui] ZIP download failed", err);
+          } catch (e) {
+            logError("ZIP browser download failed", e);
             setState((prevState) => ({
               ...prevState,
               statusMessage: "ZIP built but browser download failed",
@@ -223,6 +268,10 @@ export default function App() {
             isLoading: false,
             isZipExporting: false,
             isTidying: false,
+            figmaJson: "",
+            jsonLineCount: 0,
+            showingFullJson: false,
+            figmaJsonLoading: false,
           }));
           break;
 
@@ -243,6 +292,10 @@ export default function App() {
             isLoading: false,
             isZipExporting: false,
             isTidying: false,
+            figmaJson: "",
+            jsonLineCount: 0,
+            showingFullJson: false,
+            figmaJsonLoading: false,
           }));
           break;
 
@@ -256,9 +309,49 @@ export default function App() {
           }));
           break;
 
-        case "selection-json":
-          copy(JSON.stringify(event.data.pluginMessage.data, null, 2));
+        case "selection-json": {
+          const jsonMsg = untypedMessage as SelectionJsonMessage;
+          if (jsonMsg.purpose !== "display") {
+            const text =
+              typeof jsonMsg.jsonText === "string"
+                ? jsonMsg.jsonText
+                : JSON.stringify(jsonMsg.data, null, 2);
+            copy(text);
+            break;
+          }
+          setState((prevState) => ({
+            ...prevState,
+            figmaJson: jsonMsg.showingFull
+              ? (jsonMsg.jsonText ?? "")
+              : (jsonMsg.jsonPreview ?? jsonMsg.jsonText ?? ""),
+            jsonLineCount: jsonMsg.jsonLineCount ?? 0,
+            showingFullJson: Boolean(jsonMsg.showingFull),
+            figmaJsonLoading: false,
+          }));
           break;
+        }
+
+        case "openRouterKeyStatus": {
+          const status = untypedMessage as OpenRouterKeyStatusMessage;
+          const hasKey = Boolean(status.hasKey);
+          setState((prevState) => ({
+            ...prevState,
+            hasOpenRouterKey: hasKey,
+          }));
+          // clientStorage empty after reload → push iframe backup once.
+          if (!hasKey && !keyRestoreAttemptedRef.current) {
+            const backup = readOpenRouterKeyBackup();
+            if (backup) {
+              keyRestoreAttemptedRef.current = true;
+              parent.postMessage(
+                { pluginMessage: { type: "setOpenRouterKey", key: backup } },
+                "*",
+              );
+            }
+          }
+          if (hasKey) keyRestoreAttemptedRef.current = false;
+          break;
+        }
 
         default:
           break;
@@ -279,7 +372,6 @@ export default function App() {
     value: PluginSettings[keyof PluginSettings],
   ) => {
     if (state.settings && state.settings[key] === value) {
-      // do nothing
     } else {
       postUISettingsChangingMessage(key, value, { targetOrigin: "*" });
     }
@@ -291,7 +383,14 @@ export default function App() {
   };
 
   const handleTidyAndConvert = () => {
-    if (state.isLoading || state.isZipExporting || state.isTidying) return;
+    if (
+      state.isLoading ||
+      state.isZipExporting ||
+      state.isTidying ||
+      !state.hasOpenRouterKey
+    ) {
+      return;
+    }
     setState((prev) => ({
       ...prev,
       isTidying: true,
@@ -301,11 +400,80 @@ export default function App() {
     parent.postMessage({ pluginMessage: { type: "tidyAndConvert" } }, "*");
   };
 
+  const handleSaveOpenRouterKey = (key: string) => {
+    const trimmed = key.trim();
+    if (trimmed) writeOpenRouterKeyBackup(trimmed);
+    else clearOpenRouterKeyBackup();
+    keyRestoreAttemptedRef.current = false;
+    parent.postMessage(
+      { pluginMessage: { type: "setOpenRouterKey", key: trimmed } },
+      "*",
+    );
+  };
+
+  const handleClearOpenRouterKey = () => {
+    clearOpenRouterKeyBackup();
+    keyRestoreAttemptedRef.current = true; // do not auto-restore after explicit clear
+    parent.postMessage(
+      { pluginMessage: { type: "setOpenRouterKey", key: "" } },
+      "*",
+    );
+  };
+
   const requestFullCode = (purpose: "copy" | "display") => {
     parent.postMessage(
       { pluginMessage: { type: "requestFullCode", purpose } },
       "*",
     );
+  };
+
+  const requestPanelJson = (opts: {
+    purpose: "copy" | "display";
+    full?: boolean;
+  }) => {
+    parent.postMessage(
+      {
+        pluginMessage: {
+          type: "get-selection-json",
+          purpose: opts.purpose,
+          source: "panel",
+          full: opts.full,
+        },
+      },
+      "*",
+    );
+  };
+
+  const handlePreviewModeChange = (mode: PreviewMode) => {
+    previewModeRef.current = mode;
+    const needsFetch =
+      mode === "json" && !state.figmaJson && !state.figmaJsonLoading;
+    setState((prev) => ({
+      ...prev,
+      previewMode: mode,
+      figmaJsonLoading: needsFetch ? true : prev.figmaJsonLoading,
+    }));
+    if (needsFetch) {
+      requestPanelJson({ purpose: "display" });
+    }
+  };
+
+  const handleCopy = () => {
+    if (state.previewMode === "json") {
+      requestPanelJson({ purpose: "copy" });
+      return;
+    }
+    requestFullCode("copy");
+  };
+
+  const handleShowMore = () => {
+    if (state.previewMode === "json") {
+      if (state.showingFullJson) return;
+      setState((prev) => ({ ...prev, figmaJsonLoading: true }));
+      requestPanelJson({ purpose: "display", full: true });
+      return;
+    }
+    requestFullCode("display");
   };
 
   const darkMode = isDarkFigmaBackground(figmaColorBgValue);
@@ -318,6 +486,7 @@ export default function App() {
         isLoading={state.isLoading}
         isZipExporting={state.isZipExporting}
         isTidying={state.isTidying}
+        hasOpenRouterKey={state.hasOpenRouterKey}
         code={state.displayedCode}
         lineCount={state.lineCount}
         showingFullCode={state.showingFullCode}
@@ -330,8 +499,16 @@ export default function App() {
         progressPercent={state.progressPercent}
         onDownloadZip={handleDownloadZip}
         onTidyAndConvert={handleTidyAndConvert}
-        onCopyFullCode={() => requestFullCode("copy")}
-        onShowFullCode={() => requestFullCode("display")}
+        onSaveOpenRouterKey={handleSaveOpenRouterKey}
+        onClearOpenRouterKey={handleClearOpenRouterKey}
+        previewMode={state.previewMode}
+        figmaJson={state.figmaJson}
+        jsonLineCount={state.jsonLineCount}
+        showingFullJson={state.showingFullJson}
+        figmaJsonLoading={state.figmaJsonLoading}
+        onPreviewModeChange={handlePreviewModeChange}
+        onCopy={handleCopy}
+        onShowMore={handleShowMore}
       />
     </div>
   );

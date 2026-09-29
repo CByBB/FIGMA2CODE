@@ -1,0 +1,49 @@
+/** Vision model and pricing constants for the tidy AI stage. */
+
+import type { LayerInventoryItem } from "./inventory";
+
+export const OPENROUTER_MODEL = "xiaomi/mimo-v2.5";
+export const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+
+/** USD per 1M tokens for cost estimates logged after each vision call. */
+export const MODEL_PRICE_INPUT_PER_1M_USD = 0.119;
+export const MODEL_PRICE_OUTPUT_PER_1M_USD = 0.238;
+
+export function buildVisionSystemPrompt(): string {
+  return [
+    "You analyze UI design screenshots and a layer inventory.",
+    "Return ONLY valid JSON (no markdown) describing vertical section split lines and semantic names.",
+    "Coordinates MUST use the same root-local Y axis as the inventory (not raw screenshot pixels).",
+    "splitLinesY are horizontal cuts between major page sections, sorted ascending.",
+    "sections list content bands (solid backgrounds, card grids, CTAs). yEnd of one section may be less than yStart of the next when the design has intentional empty page background between them — do NOT stretch a section to swallow that whitespace.",
+    "Small overlaps from rounding may be closed; do not invent large gaps that are not in the design.",
+    "Do not cut through real section content: text, cards, and CTAs that straddle a cut belong in one section — move the split to the gap after that block.",
+    "Decorations, illustrations, and images that only sit on a section boundary stay in one section and may overflow; do not move the split for them.",
+    "When a section has a full-width solid background, that fill's bottom edge IS the section boundary — do not include the following whitespace or the next heading in that section.",
+    "renames map layer id → short semantic name (English); only rename clearly labeled UI.",
+    "Do not invent CSS or Auto Layout props.",
+  ].join(" ");
+}
+
+export function buildVisionUserPrompt(args: {
+  rootWidth: number;
+  rootHeight: number;
+  inventory: LayerInventoryItem[];
+}): string {
+  const { rootWidth, rootHeight, inventory } = args;
+  return [
+    `Root size: width=${rootWidth}, height=${rootHeight}.`,
+    "Layer inventory (root-local x,y,w,h):",
+    JSON.stringify(inventory),
+    "",
+    "Respond with JSON shaped exactly like:",
+    JSON.stringify({
+      splitLinesY: [120, 480],
+      sections: [
+        { name: "Hero", yStart: 0, yEnd: 120 },
+        { name: "Features", yStart: 120, yEnd: 480 },
+      ],
+      renames: { "1:23": "Hero title" },
+    }),
+  ].join("\n");
+}

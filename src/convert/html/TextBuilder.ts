@@ -1,7 +1,17 @@
 import { formatMultipleJSX, formatWithJSX } from "../css/format";
 import { HtmlDefaultBuilder } from "./DefaultBuilder";
 import { htmlColorFromFills } from "./color";
-import { commonLetterSpacing, commonLineHeight } from "../layout/text";
+import {
+  commonLetterSpacing,
+  commonLineHeight,
+  authoredNewlinesExplainBox,
+  textBoxLooksMultiline,
+  textContentExceedsLayoutWidth,
+} from "../layout/text";
+import {
+  bakeSoftBreaksFromAdvanceEstimate,
+  injectSoftBreaksIntoSegment,
+} from "../layout/bakeLines";
 import { HTMLSettings, StyledTextSegmentSubset } from "types";
 
 export class HtmlTextBuilder extends HtmlDefaultBuilder {
@@ -9,11 +19,11 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
     super(node, settings);
   }
 
-  // Override htmlElement to ensure text nodes use paragraph elements
   get htmlElement(): string {
     return "p";
   }
 
+  // Per-segment styles from toJson styledTextSegments drive inline CSS on spans.
   getTextSegments(node: TextNode): {
     style: string;
     text: string;
@@ -27,8 +37,94 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
       return [];
     }
 
+    // Emit-time fallback when toJson bake was skipped (REST dump / SVG lied
+    // single-line). Inject estimated soft breaks so webfont CSS cannot reflow
+    // past overlapping siblings (master-course book).
+    const textMeta = node as TextNode & {
+      visualLineBreaksBaked?: boolean;
+      characters: string;
+    };
+    let emitSoftBreaks: number[] | null = null;
+    if (!textMeta.visualLineBreaksBaked && textMeta.characters) {
+      const fontSize = typeof node.fontSize === "number" ? node.fontSize : 0;
+      let letterSpacingPx = 0;
+      try {
+        if (
+          fontSize > 0 &&
+          node.letterSpacing &&
+          node.letterSpacing !== figma.mixed
+        ) {
+          letterSpacingPx = commonLetterSpacing(
+            node.letterSpacing as LetterSpacing,
+            fontSize,
+          );
+        }
+      } catch {
+        /* mixed */
+      }
+      const layoutW =
+        typeof node.width === "number"
+          ? Math.abs(node.width)
+          : (
+              node as TextNode & {
+                absoluteBoundingBox?: { width?: number } | null;
+              }
+            ).absoluteBoundingBox?.width || 0;
+      const layoutH =
+        typeof node.height === "number" ? Math.abs(node.height) : 0;
+      let lineHeightPx = fontSize > 0 ? fontSize * 1.2 : 0;
+      try {
+        if (
+          fontSize > 0 &&
+          node.lineHeight &&
+          node.lineHeight !== figma.mixed
+        ) {
+          const lh = commonLineHeight(node.lineHeight as LineHeight, fontSize);
+          if (lh > 0) lineHeightPx = lh;
+        }
+      } catch {
+        /* mixed */
+      }
+      const fromLh = (node as TextNode & { lineHeightPx?: number })
+        .lineHeightPx;
+      if (typeof fromLh === "number" && fromLh > 0) lineHeightPx = fromLh;
+      const mixedSizes = Array.isArray(
+        (node as TextNode & { characterStyleOverrides?: unknown[] })
+          .characterStyleOverrides,
+      )
+        ? (
+            node as TextNode & { characterStyleOverrides?: number[] }
+          ).characterStyleOverrides!.some((v) => v !== 0)
+        : false;
+      // Mixed font sizes (鈴木英史 27px + 理事長 18px) make 0.55em/1em
+      // estimate wrap the smaller line. Skip; Figma `\n` already authored.
+      if (
+        fontSize > 0 &&
+        !mixedSizes &&
+        !authoredNewlinesExplainBox(
+          textMeta.characters,
+          layoutH,
+          lineHeightPx,
+        ) &&
+        textBoxLooksMultiline(layoutH, fontSize, lineHeightPx) &&
+        textContentExceedsLayoutWidth(
+          textMeta.characters,
+          layoutW,
+          fontSize,
+          letterSpacingPx,
+        )
+      ) {
+        const estimated = bakeSoftBreaksFromAdvanceEstimate(
+          textMeta.characters,
+          layoutW,
+          fontSize,
+          letterSpacingPx,
+        );
+        if (estimated) emitSoftBreaks = estimated.softBreakStarts;
+      }
+    }
+
     return segments.map((segment) => {
-      // Prepare additional CSS properties from layer blur and drop shadow effects.
       const additionalStyles: { [key: string]: string } = {};
 
       const layerBlurStyle = this.getLayerBlurStyle();
@@ -44,7 +140,7 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
         {
           color: htmlColorFromFills(segment.fills as any),
           "font-size": segment.fontSize,
-          "font-family": segment.fontName.family,
+          "font-family": this.fontFamilyCss(segment.fontName.family),
           "font-style": this.getFontStyle(segment.fontName.style),
           "font-weight": `${segment.fontWeight}`,
           "text-decoration": this.textDecoration(segment.textDecoration),
@@ -54,13 +150,30 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
             segment.letterSpacing,
             segment.fontSize,
           ),
-          "word-wrap": "break-word",
+          // Do not set word-wrap:break-word — with a slightly tight Figma width,
+          // browsers mid-break CJK/Latin and diverge from Figma's line breaks.
           ...additionalStyles,
         },
         false,
       );
 
-      const charsWithLineBreak = segment.characters.split("\n").join("<br/>");
+      let segmentChars = String(segment.characters || "");
+      if (
+        emitSoftBreaks &&
+        typeof segment.start === "number" &&
+        typeof segment.end === "number"
+      ) {
+        segmentChars = injectSoftBreaksIntoSegment(
+          textMeta.characters,
+          segment.start,
+          segment.end,
+          emitSoftBreaks,
+        );
+      }
+
+      // Soft wraps are baked to `\n` in toJson (Figma visual lines). Do not
+      // unwrap — that would let the browser reflow with a different webfont.
+      const charsWithLineBreak = segmentChars.split("\n").join("<br/>");
       return {
         style: styleAttributes,
         text: charsWithLineBreak,
@@ -114,27 +227,32 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
     }
   }
 
-  letterSpacing(letterSpacing: LetterSpacing, fontSize: number): number | null {
+  letterSpacing(
+    letterSpacing: LetterSpacing | number,
+    fontSize: number,
+  ): number | null {
     const letterSpacingProp = commonLetterSpacing(letterSpacing, fontSize);
-    if (letterSpacingProp > 0) {
+    if (letterSpacingProp !== 0 && Number.isFinite(letterSpacingProp)) {
       return letterSpacingProp;
     }
     return null;
   }
 
-  lineHeight(lineHeight: LineHeight, fontSize: number): number | null {
+  lineHeight(lineHeight: LineHeight | number, fontSize: number): number | null {
     const lineHeightProp = commonLineHeight(lineHeight, fontSize);
     if (lineHeightProp > 0) {
       return lineHeightProp;
     }
+    // AUTO / intrinsic: use Figma's resolved px (from REST style) so hug text
+    // matches the design box instead of the browser default multiplier.
+    const resolved = (this.node as TextNode & { lineHeightPx?: number })
+      .lineHeightPx;
+    if (typeof resolved === "number" && resolved > 0) {
+      return resolved;
+    }
     return null;
   }
 
-  /**
-   * https://tailwindcss.com/docs/font-style/
-   * example: font-extrabold
-   * example: italic
-   */
   getFontStyle(style: string): string {
     if (style.toLowerCase().match("italic")) {
       return "italic";
@@ -142,13 +260,21 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
     return "";
   }
 
+  /** Safe inside style="…": use single quotes when the family has spaces. */
+  fontFamilyCss(family: string): string {
+    const name = String(family || "")
+      .replace(/\\/g, "")
+      .replace(/'/g, "")
+      .replace(/"/g, "")
+      .trim();
+    if (!name) return "sans-serif";
+    return /[\s,]/.test(name) ? `'${name}'` : name;
+  }
+
   textAlignHorizontal(): this {
     const node = this.node as TextNode;
-    // if alignHorizontal is LEFT, don't do anything because that is native
 
-    // only undefined in testing
     if (node.textAlignHorizontal && node.textAlignHorizontal !== "LEFT") {
-      // todo when node.textAutoResize === "WIDTH_AND_HEIGHT" and there is no \n in the text, this can be ignored.
       let textAlign = "";
       switch (node.textAlignHorizontal) {
         case "CENTER":
@@ -179,38 +305,40 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
           break;
       }
       if (alignItems) {
+        // Flex column + multiple styled <span>s would stack each segment
+        // as its own row (Hero Title: 『 / 総 / 義歯…). Callers must wrap
+        // all text content in one child — see htmlText().
         this.addStyles(
           formatWithJSX("justify-content", this.isJSX, alignItems),
         );
         this.addStyles(formatWithJSX("display", this.isJSX, "flex"));
         this.addStyles(formatWithJSX("flex-direction", this.isJSX, "column"));
+        (
+          this as { _wrapTextForVerticalAlign?: boolean }
+        )._wrapTextForVerticalAlign = true;
       }
     }
     return this;
   }
 
-  /**
-   * Returns a CSS filter value for layer blur.
-   */
+  /** Layer blur on text → CSS filter (effects not baked into text SVG). */
   private getLayerBlurStyle(): string {
     if (this.node && (this.node as TextNode).effects) {
       const effects = (this.node as TextNode).effects;
       const blurEffect = effects.find(
-        (effect) =>
+        (effect): effect is BlurEffect =>
           effect.type === "LAYER_BLUR" &&
           effect.visible !== false &&
           effect.radius > 0,
       );
-      if (blurEffect && blurEffect.radius) {
+      if (blurEffect) {
         return `blur(${blurEffect.radius}px)`;
       }
     }
     return "";
   }
 
-  /**
-   * Returns a CSS text-shadow value if a drop shadow effect is applied.
-   */
+  /** Drop shadow on text → CSS text-shadow. */
   private getTextShadowStyle(): string {
     if (this.node && (this.node as TextNode).effects) {
       const effects = (this.node as TextNode).effects;
@@ -218,7 +346,7 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
         (effect) => effect.type === "DROP_SHADOW" && effect.visible !== false,
       );
       if (dropShadow) {
-        const ds = dropShadow as DropShadowEffect; // Type narrow the effect.
+        const ds = dropShadow as DropShadowEffect;
         const offsetX = Math.round(ds.offset.x);
         const offsetY = Math.round(ds.offset.y);
         const blurRadius = Math.round(ds.radius);

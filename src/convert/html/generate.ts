@@ -19,8 +19,13 @@ import {
 } from "../media/images";
 import { addWarning } from "../warnings";
 import { getCachedAsset } from "../../export/cache";
-import { framedImageTransformCss } from "../../export/flags";
+import {
+  getRotationLayoutSlot,
+  getCssRotationDeg,
+  clearSvgAssetFlips,
+} from "./blend";
 
+// Walk enriched alt-nodes and emit HTML/CSS strings for preview or ZIP index.html.
 const selfClosingTags = ["img"];
 
 export let isPreviewGlobal = false;
@@ -42,7 +47,7 @@ export const htmlMain = async (
 
   let htmlContent = await htmlWidgetGenerator(sceneNode, settings);
 
-  // remove the initial \n that is made in Container.
+  // htmlContainer prefixes output with a newline for indentation.
   if (htmlContent.length > 0 && htmlContent.startsWith("\n")) {
     htmlContent = htmlContent.slice(1, htmlContent.length);
   }
@@ -73,7 +78,7 @@ const htmlWidgetGenerator = async (
   sceneNode: ReadonlyArray<SceneNode>,
   settings: HTMLSettings,
 ): Promise<string> => {
-  // filter non visible nodes. This is necessary at this step because conversion already happened.
+  // Visibility was already handled in toJson; this catches nodes hidden after enrichment.
   const promiseOfConvertedCode = getVisibleNodes(sceneNode).map(
     convertNode(settings),
   );
@@ -82,24 +87,53 @@ const htmlWidgetGenerator = async (
 };
 
 const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
-  // Prefer SVG from ZIP asset cache (vectors, icon instances, gradient text)
+  // Hidden layers are never worth emitting — skip before SVG/cache work.
+  if (node.visible === false) {
+    return "";
+  }
+
+  // Prefer baked SVG from ZIP cache (gradient text, icon instances, effect-heavy
+  // vectors, and assetOnly RECTANGLE/ELLIPSE — e.g. Overlay+Shadow drop shadows).
+  // Plugin API uses POLYGON; REST / enriched alt-nodes may still say REGULAR_POLYGON.
   const cachedSvg = node.id ? getCachedAsset(node.id) : undefined;
+  const nodeType = node.type as string;
+  // Flattened illustration (mask groups, vector-heavy clusters) exported as PNG.
+  // Do not swallow image-fill frames that still have child layers.
+  // Use layout AABB (not renderBounds) so left/top match the Figma frame box.
+  if (
+    cachedSvg?.format === "PNG" &&
+    cachedSvg.path &&
+    settings.relativeAssetPaths &&
+    "children" in node &&
+    Array.isArray((node as SceneNode & ChildrenMixin).children) &&
+    (node as SceneNode & ChildrenMixin).children.length > 0 &&
+    (nodeType === "FRAME" ||
+      nodeType === "GROUP" ||
+      nodeType === "COMPONENT" ||
+      nodeType === "INSTANCE") &&
+    !("fills" in node && nodeHasImageFill(node))
+  ) {
+    return htmlWrapCompositePng(node, settings, cachedSvg.path);
+  }
   if (
     settings.embedVectors &&
     cachedSvg?.format === "SVG" &&
     ((node as any).canBeFlattened ||
-      node.type === "VECTOR" ||
-      node.type === "BOOLEAN_OPERATION" ||
-      node.type === "STAR" ||
-      node.type === "LINE" ||
-      node.type === "POLYGON" ||
-      node.type === "REGULAR_POLYGON" ||
-      node.type === "INSTANCE" ||
-      node.type === "COMPONENT" ||
-      node.type === "TEXT")
+      (node as any).assetOnly ||
+      nodeType === "VECTOR" ||
+      nodeType === "BOOLEAN_OPERATION" ||
+      nodeType === "STAR" ||
+      nodeType === "LINE" ||
+      nodeType === "POLYGON" ||
+      nodeType === "REGULAR_POLYGON" ||
+      nodeType === "INSTANCE" ||
+      nodeType === "COMPONENT" ||
+      nodeType === "TEXT" ||
+      nodeType === "RECTANGLE" ||
+      nodeType === "ELLIPSE")
   ) {
     (node as any).canBeFlattened = true;
-    // ZIP static HTML: reference assets/*.svg instead of inlining
+    // Static ZIP: <img src="assets/..."> instead of inlined SVG markup.
     if (settings.relativeAssetPaths && cachedSvg.path) {
       return htmlWrapSVGFile(node, settings, cachedSvg.path);
     }
@@ -122,21 +156,21 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
   switch ((node as any).type) {
     case "RECTANGLE":
     case "ELLIPSE":
-      return await htmlContainer(node, "", [], settings);
+      return await htmlContainer(node as any, "", [], settings);
     case "GROUP":
-      return await htmlGroup(node, settings);
+      return await htmlGroup(node as GroupNode, settings);
     case "FRAME":
     case "COMPONENT":
     case "INSTANCE":
     case "COMPONENT_SET":
     case "SLOT":
-      return await htmlFrame(node, settings);
+      return await htmlFrame(node as SceneNode & BaseFrameMixin, settings);
     case "SECTION":
-      return await htmlSection(node, settings);
+      return await htmlSection(node as SectionNode, settings);
     case "TEXT":
-      return htmlText(node, settings);
+      return htmlText(node as TextNode, settings);
     case "LINE":
-      return htmlLine(node, settings);
+      return htmlLine(node as LineNode, settings);
     case "VECTOR":
     case "STAR":
     case "POLYGON":
@@ -167,15 +201,197 @@ const htmlWrapSVG = (
     .addData("svg-wrapper")
     .position();
 
-  // The SVG content already has the var() references, so we don't need
-  // to add inline CSS variables in most cases. The browser will use the fallbacks
-  // if the variables aren't defined in the CSS.
-
   return `\n<div${builder.build()}>\n${indentString(node.svg ?? "")}</div>`;
 };
 
-/** Reference a baked SVG file from the ZIP assets folder (static index.html). */
+/**
+ * Size/position SVG <img> from absoluteRenderBounds when paint *overflows* the
+ * layout AABB (LINE strokes, DROP_SHADOW filters). Figma SVG export is already
+ * screen-oriented to that box; using AABB alone clips shadows or squashes lines.
+ *
+ * Do NOT use renderBounds when it is smaller than the AABB — that usually means
+ * an ancestor `clipsContent` shrank the visible paint (Hero/Skills red terrain
+ * AABB 1163×402 vs renderBounds 1163×95). Sizing to the clipped box squashes the
+ * full SVG into a flat strip; keep the AABB and let CSS `overflow: hidden` clip.
+ */
+const svgFileLayoutNode = (node: SceneNode): SceneNode => {
+  const n = node as SceneNode & {
+    absoluteRenderBounds?: Rect | null;
+    absoluteBoundingBox?: Rect | null;
+    cumulativeRotation?: number;
+  };
+  const aabb = n.absoluteBoundingBox;
+  const box =
+    node.type === "LINE"
+      ? n.absoluteRenderBounds || aabb
+      : n.absoluteRenderBounds;
+  if (!box) return node;
+
+  if (node.type !== "LINE" && aabb) {
+    const sameBox =
+      Math.abs(box.width - aabb.width) < 0.5 &&
+      Math.abs(box.height - aabb.height) < 0.5 &&
+      Math.abs(box.x - aabb.x) < 0.5 &&
+      Math.abs(box.y - aabb.y) < 0.5;
+    if (sameBox) return node;
+
+    // Ancestor clip: renderBounds is a subset of the layout box.
+    const clippedSubset =
+      box.x >= aabb.x - 0.5 &&
+      box.y >= aabb.y - 0.5 &&
+      box.x + box.width <= aabb.x + aabb.width + 0.5 &&
+      box.y + box.height <= aabb.y + aabb.height + 0.5 &&
+      (box.width < aabb.width - 0.5 || box.height < aabb.height - 0.5);
+    if (clippedSubset) return node;
+  }
+
+  const parentBox =
+    node.parent && "absoluteBoundingBox" in node.parent
+      ? (node.parent as { absoluteBoundingBox?: Rect | null })
+          .absoluteBoundingBox
+      : null;
+
+  return {
+    ...node,
+    width: Math.max(1, box.width || 0),
+    height: Math.max(1, box.height || 0),
+    x: parentBox ? box.x - parentBox.x : n.x,
+    y: parentBox ? box.y - parentBox.y : n.y,
+    ...(node.type === "LINE"
+      ? { rotation: 0, cumulativeRotation: 0 }
+      : { absoluteBoundingBox: box }),
+  } as SceneNode;
+};
+
+/**
+ * Image-fill PNGs from exportAsync include drop shadows in the bitmap
+ * (renderBounds), but node.width/height stay on the layout AABB. Sizing the
+ * <img> to the AABB (e.g. Hero Portrait 439×685 vs PNG 499×745) squashes the
+ * subject and shifts it down/sideways vs Figma.
+ *
+ * Do NOT use renderBounds when it is smaller than the AABB — that is usually
+ * an ancestor clip (test5 `k-top__bg_route` 1920×574 frame, renderBounds
+ * 1472×574). PNG export is still the full frame; sizing to the clipped box
+ * horizontally squashes the wavy divider vs design.
+ */
+const imageFillLayoutNode = (node: SceneNode): SceneNode => {
+  if (!("fills" in node) || !nodeHasImageFill(node)) return node;
+  if (
+    "children" in node &&
+    Array.isArray(node.children) &&
+    node.children.length > 0
+  ) {
+    return node;
+  }
+
+  const n = node as SceneNode & {
+    absoluteRenderBounds?: Rect | null;
+    absoluteBoundingBox?: Rect | null;
+  };
+  const box = n.absoluteRenderBounds;
+  const aabb = n.absoluteBoundingBox;
+  if (!box || !aabb) return node;
+
+  if (
+    Math.abs(box.width - aabb.width) < 0.5 &&
+    Math.abs(box.height - aabb.height) < 0.5 &&
+    Math.abs(box.x - aabb.x) < 0.5 &&
+    Math.abs(box.y - aabb.y) < 0.5
+  ) {
+    return node;
+  }
+
+  // Ancestor clip: renderBounds is a subset of the layout box (same as SVG).
+  const clippedSubset =
+    box.x >= aabb.x - 0.5 &&
+    box.y >= aabb.y - 0.5 &&
+    box.x + box.width <= aabb.x + aabb.width + 0.5 &&
+    box.y + box.height <= aabb.y + aabb.height + 0.5 &&
+    (box.width < aabb.width - 0.5 || box.height < aabb.height - 0.5);
+  if (clippedSubset) return node;
+
+  const parentBox =
+    node.parent && "absoluteBoundingBox" in node.parent
+      ? (node.parent as { absoluteBoundingBox?: Rect | null })
+          .absoluteBoundingBox
+      : null;
+
+  return {
+    ...node,
+    width: Math.max(1, box.width || 0),
+    height: Math.max(1, box.height || 0),
+    x: parentBox ? box.x - parentBox.x : n.x,
+    y: parentBox ? box.y - parentBox.y : n.y,
+    absoluteBoundingBox: box,
+  } as SceneNode;
+};
+
+/**
+ * exportAsync SVG is screen-oriented (rotation and flips are in the path,
+ * viewBox is the layout box). CSS rotate()/scale() on top, using the
+ * pre-rotation anchor, swings that art past the section edge — Skills Group 21
+ * cream cliff (514:7598) lands on rotate(180) at left:323 and overflow:hidden
+ * slices it into a vertical cut.
+ * Place the file on the AABB and drop the extra transform.
+ */
+const screenOrientedSvgNode = (node: SceneNode): SceneNode => {
+  const n = node as SceneNode & {
+    flipHorizontal?: boolean;
+    flipVertical?: boolean;
+    cumulativeRotation?: number;
+    absoluteBoundingBox?: Rect | null;
+  };
+  const deg = getCssRotationDeg(n);
+  const flipped = n.flipHorizontal === true || n.flipVertical === true;
+  if (deg === 0 && !flipped) return node;
+
+  const parentBox =
+    node.parent && "absoluteBoundingBox" in node.parent
+      ? (node.parent as { absoluteBoundingBox?: Rect | null })
+          .absoluteBoundingBox
+      : null;
+  const aabb = n.absoluteBoundingBox;
+  return {
+    ...node,
+    rotation: 0,
+    cumulativeRotation: 0,
+    flipHorizontal: false,
+    flipVertical: false,
+    ...(parentBox && aabb
+      ? { x: aabb.x - parentBox.x, y: aabb.y - parentBox.y }
+      : {}),
+  } as SceneNode;
+};
+
+/** ZIP index.html: reference a pre-exported SVG under assets/ rather than inlining. */
 const htmlWrapSVGFile = (
+  node: SceneNode,
+  settings: HTMLSettings,
+  assetPath: string,
+): string => {
+  const layoutNode = screenOrientedSvgNode(svgFileLayoutNode(node));
+  const builder = new HtmlDefaultBuilder(layoutNode, settings)
+    .addData("svg-wrapper")
+    .commonPositionStyles();
+
+  const extra = [formatWithJSX("display", false, "block")];
+  const alt =
+    node.type === "TEXT" && "characters" in node
+      ? String((node as TextNode).characters)
+          .replace(/&/g, "&amp;")
+          .replace(/"/g, "&quot;")
+          .replace(/</g, "&lt;")
+      : "";
+
+  return `\n<img${builder.build(extra)} src="${assetPath}" alt="${alt}" />`;
+};
+
+/**
+ * Rasterized frame/group composites must keep the layout AABB. Using
+ * absoluteRenderBounds (overflow) places a huge img at the wrong origin —
+ * e.g. Mask group 519×493 at (584,569) became 1103×1061 at (0,0).
+ */
+const htmlWrapCompositePng = (
   node: SceneNode,
   settings: HTMLSettings,
   assetPath: string,
@@ -183,14 +399,7 @@ const htmlWrapSVGFile = (
   const builder = new HtmlDefaultBuilder(node, settings)
     .addData("svg-wrapper")
     .commonPositionStyles();
-
-  const tx = framedImageTransformCss(node);
-  const extra: string[] = [];
-  if (tx) {
-    extra.push(formatWithJSX("transform", false, tx));
-  }
-  extra.push(formatWithJSX("display", false, "block"));
-
+  const extra = [formatWithJSX("display", false, "block")];
   return `\n<img${builder.build(extra)} src="${assetPath}" alt="" />`;
 };
 
@@ -198,15 +407,15 @@ const htmlGroup = async (
   node: GroupNode,
   settings: HTMLSettings,
 ): Promise<string> => {
-  // ignore the view when size is zero or less
-  // while technically it shouldn't get less than 0, due to rounding errors,
-  // it can get to values like: -0.000004196293048153166
-  // also ignore if there are no children inside, which makes no sense
+  // Skip degenerate groups (rounding can yield negative dimensions).
   if (node.width < 0 || node.height <= 0 || node.children.length === 0) {
     return "";
   }
 
-  // this needs to be called after CustomNode because widthHeight depends on it
+  // SVG export already contains flips; a CSS scale would double-mirror.
+  clearSvgAssetFlips(node);
+
+  // commonPositionStyles must run before child layout (width/height depend on positioning mode).
   const builder = new HtmlDefaultBuilder(node, settings).commonPositionStyles();
 
   if (builder.styles) {
@@ -257,6 +466,33 @@ const htmlText = (node: TextNode, settings: HTMLSettings): string => {
       .join("");
   }
 
+  // Keep mixed-size inline runs as one flex item under vertical align.
+  if (
+    (layoutBuilder as { _wrapTextForVerticalAlign?: boolean })
+      ._wrapTextForVerticalAlign &&
+    content
+  ) {
+    content = `<span style="display: block; width: 100%; min-width: 0">${content}</span>`;
+  }
+
+  // In-flow rotated text (FEATURE 01): reserve the AABB slot so HUG parents
+  // size correctly; absolutely place the pre-rotation box inside for rotate().
+  const rotSlot = getRotationLayoutSlot(node);
+  if (rotSlot) {
+    layoutBuilder.addStyles(
+      formatWithJSX("left", false, rotSlot.innerLeft),
+      formatWithJSX("top", false, rotSlot.innerTop),
+      formatWithJSX("position", false, "absolute"),
+    );
+    const slotStyle = [
+      formatWithJSX("width", false, rotSlot.width),
+      formatWithJSX("height", false, rotSlot.height),
+      formatWithJSX("position", false, "relative"),
+      formatWithJSX("flex-shrink", false, "0"),
+    ].join("; ");
+    return `\n<div style="${slotStyle}">\n${indentString(`<div${layoutBuilder.build()}>${content}</div>`)}\n</div>`;
+  }
+
   return `\n<div${layoutBuilder.build()}>${content}</div>`;
 };
 
@@ -264,6 +500,9 @@ const htmlFrame = async (
   node: SceneNode & BaseFrameMixin,
   settings: HTMLSettings,
 ): Promise<string> => {
+  // Reflection groups (terrain+torii): SVG files already bake the flip.
+  clearSvgAssetFlips(node);
+
   const childrenStr = await htmlWidgetGenerator(node.children, settings);
 
   if (node.layoutMode !== "NONE") {
@@ -271,13 +510,10 @@ const htmlFrame = async (
     return await htmlContainer(node, childrenStr, rowColumn, settings);
   }
 
-  // node.layoutMode === "NONE" && node.children.length > 1
-  // children needs to be absolute
+  // layoutMode NONE with multiple children → absolute positioning inside container.
   return await htmlContainer(node, childrenStr, [], settings);
 };
 
-// properties named propSomething always take care of ","
-// sometimes a property might not exist, so it doesn't add ","
 const htmlContainer = async (
   node: SceneNode &
     SceneNodeMixin &
@@ -289,12 +525,12 @@ const htmlContainer = async (
   additionalStyles: string[] = [],
   settings: HTMLSettings,
 ): Promise<string> => {
-  // ignore the view when size is zero or less
   if (node.width <= 0 || node.height <= 0) {
     return children;
   }
 
-  const builder = new HtmlDefaultBuilder(node, settings)
+  const layoutNode = imageFillLayoutNode(node);
+  const builder = new HtmlDefaultBuilder(layoutNode, settings)
     .commonPositionStyles()
     .commonShapeStyles();
 
@@ -302,9 +538,12 @@ const htmlContainer = async (
     let tag = "div";
     let src = "";
 
-    if (nodeHasImageFill(node)) {
-      const altNode = node as PluginAltNode<ExportableNode>;
-      const hasChildren = "children" in node && node.children.length > 0;
+    if ("fills" in layoutNode && nodeHasImageFill(layoutNode)) {
+      const altNode = layoutNode as PluginAltNode<ExportableNode>;
+      const hasChildren =
+        "children" in layoutNode &&
+        Array.isArray((layoutNode as SceneNode & ChildrenMixin).children) &&
+        (layoutNode as SceneNode & ChildrenMixin).children.length > 0;
       let imgUrl = "";
 
       if (settings.embedImages) {
@@ -313,7 +552,7 @@ const htmlContainer = async (
             relativeAssetPaths: settings.relativeAssetPaths,
           })) ?? "";
       } else {
-        imgUrl = getPlaceholderImage(node.width, node.height);
+        imgUrl = getPlaceholderImage(layoutNode.width, layoutNode.height);
       }
 
       if (hasChildren) {
@@ -323,15 +562,7 @@ const htmlContainer = async (
       } else {
         tag = "img";
         src = ` src="${imgUrl}"`;
-        if (
-          (node as any).imageAssetFramed ||
-          getCachedAsset(node.id)?.imageAssetFramed
-        ) {
-          const tx = framedImageTransformCss(node);
-          if (tx) {
-            builder.addStyles(formatWithJSX("transform", false, tx));
-          }
-        }
+        // Flip scale is already in htmlRotation via commonPositionStyles → blend.
       }
     }
 

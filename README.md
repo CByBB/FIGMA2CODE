@@ -13,7 +13,9 @@ Converts Figma selections into **HTML + CSS** and downloads a **ZIP** with `inde
 
 Docs:
 
-- [docs/logic.md](docs/logic.md) — pipeline, ZIP accuracy rules, messaging
+- [docs/logic.md](docs/logic.md) — UX + conversion flow diagrams
+- [docs/plan/plan-verified-agent.md](docs/plan/plan-verified-agent.md) — direction: fidelity + clean code via hybrid agent
+- [docs/plan/phases/](docs/plan/phases/README.md) — day-by-day phases, stack/SDKs, OpenRouter, plugin↔local agent bridge
 - [docs/user-guide.md](docs/user-guide.md) — build, import into Figma Desktop, debug consoles
 
 ## Hard cases

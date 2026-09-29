@@ -1,0 +1,1708 @@
+/** Applies AI section bands and semantic renames to the clone before Auto Layout inference. */
+
+import type { AiVisionResult } from "./openrouter";
+import { listRootDirectChildren } from "./inventory";
+import { logError, safeNodeRef } from "../../shared/log";
+import {
+  OVERLAP_AREA_RATIO,
+  containsPoint,
+  intervalOverlap,
+  overlapArea,
+  overlapRatioOfMin,
+  rectArea,
+  type Rect,
+} from "../geometry";
+import {
+  placeLocalBox,
+  TIDY_LIFTED_KEY,
+  convertGroupToFrame,
+} from "../preserve";
+import { tidyWarn } from "../warnings";
+
+/** Near full-bleed page child — already a section shell, not a card. */
+const SECTION_WIDTH_RATIO = 0.8;
+/** Stretch only when already essentially page-wide; inset grids keep width. */
+const SECTION_FULL_BLEED_RATIO = 0.95;
+/**
+ * Keep designer whitespace between section shells (test4 Hero→Mission /
+ * Mission→CEO ≈100px of page background). Smaller gaps are treated as
+ * rounding and still collapse.
+ */
+const SECTION_GAP_KEEP_PX = 24;
+/** PluginData on transparent spacer frames inserted for SECTION_GAP_KEEP_PX. */
+const TIDY_SECTION_GAP_KEY = "tidy.sectionGap";
+
+export type AppliedAiSectionsStats = {
+  sectionCount: number;
+  assignedCount: number;
+  unassignedCount: number;
+  renameApplied: number;
+  renameSkipped: number;
+  scaleApplied: number | null;
+  elapsedMs: number;
+};
+
+function uniqueSorted(nums: number[]): number[] {
+  return [...new Set(nums.map((n) => Math.round(n * 100) / 100))].sort(
+    (a, b) => a - b,
+  );
+}
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function isSectionGapSpacer(node: SceneNode): boolean {
+  return (
+    "getPluginData" in node &&
+    typeof (node as FrameNode).getPluginData === "function" &&
+    (node as FrameNode).getPluginData(TIDY_SECTION_GAP_KEY) === "1"
+  );
+}
+
+/**
+ * Vertical gaps between consecutive band *content* from the clone's current
+ * absolute positions (before reparent/resize). AI bands are often contiguous
+ * even when the design leaves ~100px of page background between shells.
+ */
+function measureBandContentGaps(
+  bands: BandMembers[],
+  root: SceneNode,
+): number[] {
+  const gaps: number[] = [];
+  for (let i = 0; i < bands.length - 1; i++) {
+    let upperBottom = -Infinity;
+    let lowerTop = Infinity;
+    for (const m of bands[i].members) {
+      const r = childRootRect(m, root);
+      if (r) upperBottom = Math.max(upperBottom, r.y + r.height);
+    }
+    for (const m of bands[i + 1].members) {
+      const r = childRootRect(m, root);
+      if (r) lowerTop = Math.min(lowerTop, r.y);
+    }
+    if (!Number.isFinite(upperBottom) || !Number.isFinite(lowerTop)) {
+      gaps.push(0);
+      continue;
+    }
+    gaps.push(lowerTop - upperBottom);
+  }
+  return gaps;
+}
+
+function createSectionGapSpacer(page: FrameNode, height: number): FrameNode {
+  const h = Math.max(1, Math.round(height * 100) / 100);
+  const spacer = figma.createFrame();
+  spacer.name = "Section Gap";
+  spacer.fills = [];
+  spacer.strokes = [];
+  spacer.clipsContent = false;
+  spacer.resizeWithoutConstraints(Math.max(1, page.width), h);
+  try {
+    spacer.setPluginData(TIDY_SECTION_GAP_KEY, "1");
+  } catch {
+    /* pluginData unavailable */
+  }
+  return spacer;
+}
+
+/**
+ * Insert transparent full-bleed spacers between flow sections so page Auto
+ * Layout keeps designer whitespace (page background showing through).
+ */
+function interleaveSectionGapSpacers(
+  page: FrameNode,
+  sections: FrameNode[],
+  gaps: number[],
+): FrameNode[] {
+  if (sections.length === 0 || gaps.length === 0) return sections;
+  const out: FrameNode[] = [];
+  for (let i = 0; i < sections.length; i++) {
+    out.push(sections[i]);
+    const gap = i < gaps.length ? gaps[i] : 0;
+    if (gap < SECTION_GAP_KEEP_PX) continue;
+    const spacer = createSectionGapSpacer(page, gap);
+    try {
+      const at = page.children.indexOf(sections[i]);
+      if (at >= 0) page.insertChild(at + 1, spacer);
+      else page.appendChild(spacer);
+    } catch (e) {
+      logError(`section gap spacer insert failed`, e);
+      try {
+        spacer.remove();
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
+    out.push(spacer);
+  }
+  return out;
+}
+
+function resizePageToFitFlow(page: FrameNode): void {
+  let total = 0;
+  for (const child of page.children) {
+    if (child.visible === false) continue;
+    if (
+      "layoutPositioning" in child &&
+      (child as FrameNode).layoutPositioning === "ABSOLUTE"
+    ) {
+      continue;
+    }
+    if ("height" in child) total += Math.max(0, child.height);
+  }
+  if (total < 1) return;
+  const next = Math.round(total * 100) / 100;
+  if (Math.abs(page.height - next) < 0.5) return;
+  try {
+    page.resizeWithoutConstraints(Math.max(1, page.width), Math.max(1, next));
+  } catch (e) {
+    logError(`page resize-to-fit failed (${safeNodeRef(page)})`, e);
+  }
+}
+
+/**
+ * Force section bands to abut: band[i].yEnd === band[i+1].yStart, covering [0, rootHeight].
+ * AI often returns slight gaps/overlaps; those become visible holes between section frames.
+ * Large intentional gaps are preserved later via measureBandContentGaps spacers — this
+ * only closes sub-SECTION_GAP_KEEP_PX noise in the AI band edges.
+ */
+function normalizeContiguousBands(
+  bands: Array<{ name: string; yStart: number; yEnd: number }>,
+  rootHeight: number,
+): Array<{ name: string; yStart: number; yEnd: number }> {
+  if (bands.length === 0) return [];
+  if (rootHeight <= 0) return bands;
+
+  const sorted = [...bands].sort(
+    (a, b) => a.yStart - b.yStart || a.yEnd - b.yEnd,
+  );
+  const n = sorted.length;
+  if (n === 1) {
+    return [{ name: sorted[0].name, yStart: 0, yEnd: rootHeight }];
+  }
+
+  // Cuts between consecutive sections: midpoint of proposed shared edge / gap / overlap.
+  const cuts: number[] = [];
+  for (let i = 0; i < n - 1; i++) {
+    const cut = (sorted[i].yEnd + sorted[i + 1].yStart) / 2;
+    cuts.push(cut);
+  }
+
+  const edges: number[] = [0];
+  for (let i = 0; i < cuts.length; i++) {
+    const remainingCuts = cuts.length - i;
+    const minEdge = edges[edges.length - 1] + 1;
+    const maxEdge = rootHeight - remainingCuts;
+    edges.push(clamp(cuts[i], minEdge, Math.max(minEdge, maxEdge)));
+  }
+  edges.push(rootHeight);
+
+  // Ensure strictly increasing (degenerate AI ranges).
+  for (let i = 1; i < edges.length; i++) {
+    if (edges[i] <= edges[i - 1]) {
+      edges[i] = Math.min(rootHeight, edges[i - 1] + 1);
+    }
+  }
+  edges[edges.length - 1] = rootHeight;
+
+  return sorted.map((s, i) => ({
+    name: s.name,
+    yStart: Math.round(edges[i] * 100) / 100,
+    yEnd: Math.round(edges[i + 1] * 100) / 100,
+  }));
+}
+
+function buildBands(
+  splitLinesY: number[],
+  sections: AiVisionResult["sections"],
+  rootHeight: number,
+): Array<{ name: string; yStart: number; yEnd: number }> {
+  if (sections.length > 0) {
+    const raw = sections
+      .map((s) => ({
+        name: s.name || "Section",
+        yStart: Math.max(0, s.yStart),
+        yEnd: Math.min(rootHeight, Math.max(s.yStart + 1, s.yEnd)),
+      }))
+      .sort((a, b) => a.yStart - b.yStart);
+    return normalizeContiguousBands(raw, rootHeight);
+  }
+
+  const cuts = uniqueSorted(
+    splitLinesY.filter((y) => y > 1 && y < rootHeight - 1),
+  );
+  const edges = [0, ...cuts, rootHeight];
+  const bands: Array<{ name: string; yStart: number; yEnd: number }> = [];
+  for (let i = 0; i < edges.length - 1; i++) {
+    bands.push({
+      name: `Section ${i + 1}`,
+      yStart: edges[i],
+      yEnd: edges[i + 1],
+    });
+  }
+  return normalizeContiguousBands(bands, rootHeight);
+}
+
+type BandMembers = {
+  name: string;
+  yStart: number;
+  yEnd: number;
+  members: SceneNode[];
+};
+
+/**
+ * Drop empty bands but keep a continuous Y cover by absorbing their range into neighbors.
+ */
+function collapseEmptyBands(
+  bands: Array<{ name: string; yStart: number; yEnd: number }>,
+  assignments: Map<number, SceneNode[]>,
+): BandMembers[] {
+  const raw: BandMembers[] = bands.map((b, i) => ({
+    ...b,
+    members: assignments.get(i) || [],
+  }));
+
+  const out: BandMembers[] = [];
+  for (const band of raw) {
+    if (band.members.length === 0) {
+      if (out.length > 0) {
+        out[out.length - 1].yEnd = band.yEnd;
+      } else {
+        out.push({ ...band, members: [] });
+      }
+      continue;
+    }
+    if (out.length > 0 && out[out.length - 1].members.length === 0) {
+      const leading = out.pop()!;
+      out.push({
+        name: band.name,
+        yStart: leading.yStart,
+        yEnd: band.yEnd,
+        members: band.members,
+      });
+    } else {
+      out.push({ ...band });
+    }
+  }
+
+  return out.filter((b) => b.members.length > 0);
+}
+
+/**
+ * Vision models sometimes return Y in screenshot pixels — rescale into root layout coords
+ * when values clearly exceed the frame height.
+ */
+export function maybeScaleAiCoords(
+  result: AiVisionResult,
+  rootHeight: number,
+  imageHeightPx: number,
+): { result: AiVisionResult; scale: number | null } {
+  const ys = [
+    ...result.splitLinesY,
+    ...result.sections.flatMap((s) => [s.yStart, s.yEnd]),
+  ].filter((n) => Number.isFinite(n));
+  if (ys.length === 0) return { result, scale: null };
+
+  const maxY = Math.max(...ys);
+  // Values well above layout height indicate screenshot-space coordinates.
+  if (maxY > rootHeight * 1.35 && imageHeightPx > 0) {
+    const scale = rootHeight / imageHeightPx;
+    return {
+      scale,
+      result: {
+        ...result,
+        splitLinesY: result.splitLinesY.map((y) => y * scale),
+        sections: result.sections.map((s) => ({
+          ...s,
+          yStart: s.yStart * scale,
+          yEnd: s.yEnd * scale,
+        })),
+      },
+    };
+  }
+  return { result, scale: null };
+}
+
+function childCenterY(child: SceneNode, root: SceneNode): number {
+  const rect = childRootRect(child, root);
+  if (rect) return rect.y + rect.height / 2;
+  return 0;
+}
+
+function childRootRect(child: SceneNode, root: SceneNode): Rect | null {
+  if (
+    "absoluteBoundingBox" in child &&
+    child.absoluteBoundingBox &&
+    "absoluteBoundingBox" in root &&
+    root.absoluteBoundingBox
+  ) {
+    const c = child.absoluteBoundingBox;
+    const r = root.absoluteBoundingBox;
+    return {
+      x: c.x - r.x,
+      y: c.y - r.y,
+      width: c.width,
+      height: c.height,
+    };
+  }
+  if ("x" in child && "width" in child) {
+    const lm = child as LayoutMixin;
+    return { x: lm.x, y: lm.y, width: lm.width, height: lm.height };
+  }
+  return null;
+}
+
+function bandClipRect(
+  band: { yStart: number; yEnd: number },
+  rootWidth: number,
+): Rect {
+  return {
+    x: 0,
+    y: band.yStart,
+    width: rootWidth,
+    height: Math.max(0, band.yEnd - band.yStart),
+  };
+}
+
+/** Fraction of the band rectangle covered by `rects` (overlaps can sum above 1). */
+function coverageInBand(
+  rects: Array<Rect | null>,
+  band: { yStart: number; yEnd: number },
+  rootWidth: number,
+): number {
+  const clip = bandClipRect(band, rootWidth);
+  const area = rectArea(clip);
+  if (area <= 0) return 0;
+  let sum = 0;
+  for (const r of rects) {
+    if (r) sum += overlapArea(r, clip);
+  }
+  return sum / area;
+}
+
+function hasFullBleedStrip(
+  rects: Array<Rect | null>,
+  band: { yStart: number; yEnd: number },
+  rootWidth: number,
+): boolean {
+  const bandH = band.yEnd - band.yStart;
+  if (bandH <= 0) return false;
+  return rects.some((r) => {
+    if (!r) return false;
+    const yOv = intervalOverlap(r.y, r.y + r.height, band.yStart, band.yEnd);
+    return r.width >= rootWidth * 0.9 && yOv >= bandH * 0.6;
+  });
+}
+
+/** Full-width canvas that sits behind multiple sections — not a card or photo. */
+function isPageBackground(
+  rect: Rect,
+  rootWidth: number,
+  rootHeight: number,
+): boolean {
+  return rect.width >= rootWidth * 0.9 && rect.height >= rootHeight * 0.08;
+}
+
+function hasSolidFill(node: SceneNode): boolean {
+  if (!("fills" in node)) return false;
+  const fills = (node as MinimalFillsMixin).fills;
+  if (fills === figma.mixed || !Array.isArray(fills)) return false;
+  return fills.some(
+    (f) => f && f.visible !== false && f.type === "SOLID" && "color" in f,
+  );
+}
+
+/**
+ * Full-width solid fill that paints this section's canvas. Top aligns with the
+ * band; a leftover below the fill is a different section (color change).
+ */
+function findSectionBackground(
+  band: BandMembers,
+  root: SceneNode,
+  rootWidth: number,
+): { node: SceneNode; rect: Rect } | null {
+  let best: { node: SceneNode; rect: Rect } | null = null;
+  let bestCover = 0;
+
+  for (const m of band.members) {
+    if (!hasSolidFill(m)) continue;
+    const r = childRootRect(m, root);
+    if (!r || r.width < rootWidth * 0.9 || r.height < 80) continue;
+    if (r.y > band.yStart + 64) continue;
+
+    let cover = 0;
+    for (const o of band.members) {
+      if (o === m) continue;
+      const box = childRootRect(o, root);
+      if (!box) continue;
+      if (containsPoint(r, box.x + box.width / 2, box.y + box.height / 2)) {
+        cover += 1;
+      }
+    }
+    if (cover > bestCover) {
+      bestCover = cover;
+      best = { node: m, rect: r };
+    }
+  }
+
+  return bestCover > 0 ? best : null;
+}
+
+function compositionOverlap(
+  a: SceneNode,
+  b: SceneNode,
+  root: SceneNode,
+): boolean {
+  const ar = childRootRect(a, root);
+  const br = childRootRect(b, root);
+  return !!(ar && br && overlapRatioOfMin(ar, br) >= OVERLAP_AREA_RATIO);
+}
+
+/** True when a layer crosses `cut` by at least 20% of its own height (not a sliver). */
+function isSignificantStraddle(rect: Rect, cut: number): boolean {
+  const top = rect.y;
+  const bottom = rect.y + rect.height;
+  if (top >= cut || bottom <= cut) return false;
+  const minority = Math.min(cut - top, bottom - cut);
+  return minority >= rect.height * 0.2;
+}
+
+function hasImageFill(node: SceneNode): boolean {
+  if (!("fills" in node)) return false;
+  const fills = (node as MinimalFillsMixin).fills;
+  if (fills === figma.mixed || !Array.isArray(fills)) return false;
+  return fills.some((f) => f && f.visible !== false && f.type === "IMAGE");
+}
+
+/** Wide/tall photo that defines a section — not a small overflow decoration. */
+function isMajorVisual(
+  node: SceneNode,
+  root: SceneNode,
+  rootWidth: number,
+): boolean {
+  const r = childRootRect(node, root);
+  if (!r || !hasImageFill(node)) return false;
+  return r.width >= rootWidth * 0.45 && r.height >= 200;
+}
+
+/** Text, cards, CTAs — moving the split is justified. */
+function isSectionContent(
+  node: SceneNode,
+  root: SceneNode,
+  rootWidth: number,
+  rootHeight: number,
+): boolean {
+  if (node.type === "TEXT") return true;
+  if (node.type === "INSTANCE" || node.type === "COMPONENT") return true;
+  const r = childRootRect(node, root);
+  if (!r || isPageBackground(r, rootWidth, rootHeight)) return false;
+  if (node.type !== "RECTANGLE" && node.type !== "FRAME") return false;
+  const wr = r.width / rootWidth;
+  return wr >= 0.25 && wr <= 0.72 && r.height >= 48 && r.height <= 420;
+}
+
+/** Large image/shape that a content layer sits on — include in the cut, not overflow. */
+function isContentSurface(
+  node: SceneNode,
+  content: SceneNode[],
+  root: SceneNode,
+  rootWidth: number,
+  rootHeight: number,
+): boolean {
+  const r = childRootRect(node, root);
+  if (!r || isPageBackground(r, rootWidth, rootHeight)) return false;
+  if (r.width < rootWidth * 0.35) return false;
+  return content.some((c) => {
+    const cr = childRootRect(c, root);
+    if (!cr) return false;
+    return containsPoint(r, cr.x + cr.width / 2, cr.y + cr.height / 2);
+  });
+}
+
+function clusterContentMembers(
+  cluster: SceneNode[],
+  root: SceneNode,
+  rootWidth: number,
+  rootHeight: number,
+): SceneNode[] {
+  return cluster.filter((m) =>
+    isSectionContent(m, root, rootWidth, rootHeight),
+  );
+}
+
+function clusterCutMembers(
+  cluster: SceneNode[],
+  root: SceneNode,
+  rootWidth: number,
+  rootHeight: number,
+): SceneNode[] {
+  const content = clusterContentMembers(cluster, root, rootWidth, rootHeight);
+  const surfaces = cluster.filter((m) =>
+    isContentSurface(m, content, root, rootWidth, rootHeight),
+  );
+  return [...new Set([...content, ...surfaces])];
+}
+
+/**
+ * Expand a seed set through overlapping siblings, skipping page backgrounds so a
+ * section canvas does not glue unrelated chrome into the composition.
+ */
+function growOverlapCluster(
+  seeds: SceneNode[],
+  candidates: SceneNode[],
+  root: SceneNode,
+  rootWidth: number,
+  rootHeight: number,
+): SceneNode[] {
+  const cluster = new Set(seeds);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const c of candidates) {
+      if (cluster.has(c)) continue;
+      const cr = childRootRect(c, root);
+      if (!cr || isPageBackground(cr, rootWidth, rootHeight)) continue;
+      for (const s of cluster) {
+        if (compositionOverlap(s, c, root)) {
+          cluster.add(c);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  return [...cluster];
+}
+
+function clusterBottom(members: SceneNode[], root: SceneNode): number | null {
+  let max = -Infinity;
+  for (const m of members) {
+    const r = childRootRect(m, root);
+    if (!r) continue;
+    max = Math.max(max, r.y + r.height);
+  }
+  return max === -Infinity ? null : max;
+}
+
+function clusterTop(members: SceneNode[], root: SceneNode): number | null {
+  let min = Infinity;
+  for (const m of members) {
+    const r = childRootRect(m, root);
+    if (!r) continue;
+    min = Math.min(min, r.y);
+  }
+  return min === Infinity ? null : min;
+}
+
+/** Prefer the band the layer occupies most; center Y breaks ties and empty overlap. */
+function pickBandIndex(
+  rect: Rect | null,
+  cy: number,
+  bands: Array<{ yStart: number; yEnd: number }>,
+): number {
+  if (rect && bands.length > 0) {
+    let bestIdx = -1;
+    let bestOv = 0;
+    for (let i = 0; i < bands.length; i++) {
+      const ov = intervalOverlap(
+        rect.y,
+        rect.y + rect.height,
+        bands[i].yStart,
+        bands[i].yEnd,
+      );
+      if (ov > bestOv + 0.5) {
+        bestOv = ov;
+        bestIdx = i;
+      } else if (bestIdx >= 0 && Math.abs(ov - bestOv) <= 0.5 && ov > 0) {
+        const b = bands[i];
+        const inBand =
+          i === bands.length - 1
+            ? cy >= b.yStart && cy <= b.yEnd + 0.5
+            : cy >= b.yStart && cy < b.yEnd;
+        if (inBand) bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0 && bestOv > 0) return bestIdx;
+  }
+
+  let idx = bands.findIndex((b) => cy >= b.yStart && cy < b.yEnd);
+  if (idx < 0) {
+    idx = bands.findIndex(
+      (b, i) => i === bands.length - 1 && cy >= b.yStart && cy <= b.yEnd + 0.5,
+    );
+  }
+  return idx;
+}
+
+function roundEdge(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function isSparseBand(
+  band: BandMembers,
+  prev: BandMembers | undefined,
+  next: BandMembers | undefined,
+  root: SceneNode,
+  rootWidth: number,
+): boolean {
+  const rectsOf = (members: SceneNode[]) =>
+    members.map((m) => childRootRect(m, root));
+  if (hasFullBleedStrip(rectsOf(band.members), band, rootWidth)) return false;
+  const own = coverageInBand(rectsOf(band.members), band, rootWidth);
+  const prevC = prev
+    ? coverageInBand(rectsOf(prev.members), band, rootWidth)
+    : 0;
+  const nextC = next
+    ? coverageInBand(rectsOf(next.members), band, rootWidth)
+    : 0;
+  return prevC + nextC >= 0.4 && own < 0.2;
+}
+
+/**
+ * Decide per overlapping group: move the split only for real section content.
+ * Boundary decorations stay in one section (majority overlap) and overflow;
+ * they must not drag the cut.
+ */
+function healBoundaryCompositions(
+  bands: BandMembers[],
+  root: SceneNode,
+  rootWidth: number,
+  rootHeight: number,
+  childOrder: Map<SceneNode, number>,
+): BandMembers[] {
+  const out: BandMembers[] = bands.map((b) => ({
+    ...b,
+    members: [...b.members],
+  }));
+
+  const sortMembers = (members: SceneNode[]) =>
+    [...members].sort(
+      (a, b) => (childOrder.get(a) ?? 0) - (childOrder.get(b) ?? 0),
+    );
+
+  const isBgNode = (m: SceneNode) => {
+    const r = childRootRect(m, root);
+    return !!r && isPageBackground(r, rootWidth, rootHeight);
+  };
+
+  for (let i = 0; i < out.length - 1; i++) {
+    const upper = out[i];
+    const lower = out[i + 1];
+    let cut = upper.yEnd;
+    const pool = [...upper.members, ...lower.members];
+
+    const straddleSeeds = pool.filter((m) => {
+      const r = childRootRect(m, root);
+      return (
+        r &&
+        !isPageBackground(r, rootWidth, rootHeight) &&
+        isSignificantStraddle(r, cut)
+      );
+    });
+
+    const leftover =
+      straddleSeeds.length === 0 &&
+      isSparseBand(upper, out[i - 1], lower, root, rootWidth);
+    const leftoverSeeds = leftover
+      ? upper.members.filter((m) =>
+          lower.members.some((n) => compositionOverlap(m, n, root)),
+        )
+      : [];
+
+    const seeds = straddleSeeds.length > 0 ? straddleSeeds : leftoverSeeds;
+    if (seeds.length === 0) continue;
+
+    const seen = new Set<SceneNode>();
+    const groups: SceneNode[][] = [];
+    for (const seed of seeds) {
+      if (seen.has(seed)) continue;
+      const group = growOverlapCluster(
+        [seed],
+        pool,
+        root,
+        rootWidth,
+        rootHeight,
+      );
+      for (const m of group) seen.add(m);
+      groups.push(group);
+    }
+
+    for (const cluster of groups) {
+      const fromUpper = cluster.filter((m) => upper.members.includes(m));
+      const fromLower = cluster.filter((m) => lower.members.includes(m));
+      const visuals = cluster.filter((m) => isMajorVisual(m, root, rootWidth));
+      const content = clusterContentMembers(
+        cluster,
+        root,
+        rootWidth,
+        rootHeight,
+      );
+      const visualOverflow = visuals.some((v) => {
+        const r = childRootRect(v, root);
+        return r ? isSignificantStraddle(r, cut) : false;
+      });
+
+      if (fromUpper.length === 0 && fromLower.length === 0) continue;
+      if (
+        !visualOverflow &&
+        (fromUpper.length === 0 || fromLower.length === 0) &&
+        content.length === 0
+      ) {
+        continue;
+      }
+
+      // Small boundary ornaments: keep the cut, overflow, contain by majority.
+      if (content.length === 0 && visuals.length === 0) {
+        for (const m of cluster) {
+          const r = childRootRect(m, root);
+          if (!r) continue;
+          const upperOv = intervalOverlap(
+            r.y,
+            r.y + r.height,
+            upper.yStart,
+            upper.yEnd,
+          );
+          const lowerOv = intervalOverlap(
+            r.y,
+            r.y + r.height,
+            lower.yStart,
+            lower.yEnd,
+          );
+          const dest = upperOv >= lowerOv ? upper : lower;
+          const src = dest === upper ? lower : upper;
+          if (src.members.includes(m)) {
+            src.members = src.members.filter((x) => x !== m);
+            dest.members.push(m);
+          }
+        }
+        upper.members = sortMembers(upper.members);
+        lower.members = sortMembers(lower.members);
+        continue;
+      }
+
+      const cutGroup =
+        content.length > 0
+          ? clusterCutMembers(cluster, root, rootWidth, rootHeight)
+          : visuals;
+      const top = clusterTop(cutGroup, root);
+      if (top == null) continue;
+      const ownerIsUpper = top < cut;
+
+      const owner = ownerIsUpper ? upper : lower;
+      const donor = ownerIsUpper ? lower : upper;
+
+      const bleeds = donor.members.filter((m) => {
+        if (cluster.includes(m) || !isBgNode(m)) return false;
+        return cluster.some((s) => {
+          const a = childRootRect(s, root);
+          const b = childRootRect(m, root);
+          return !!(a && b && overlapArea(a, b) > 0);
+        });
+      });
+
+      // Layers sitting in the overflow band belong with the photo, not the next section.
+      const overflowTaken: SceneNode[] = [];
+      if (visuals.length > 0 && ownerIsUpper) {
+        const bottom = clusterBottom(cutGroup, root);
+        if (bottom != null) {
+          for (const m of donor.members) {
+            if (cluster.includes(m) || bleeds.includes(m)) continue;
+            const r = childRootRect(m, root);
+            if (!r) continue;
+            if (r.y + r.height / 2 < bottom) overflowTaken.push(m);
+          }
+        }
+      }
+
+      const taken = new Set([
+        ...cluster.filter((m) => donor.members.includes(m)),
+        ...bleeds,
+        ...overflowTaken,
+      ]);
+
+      donor.members = donor.members.filter((m) => !taken.has(m));
+      if (taken.size > 0) {
+        owner.members = sortMembers([...owner.members, ...taken]);
+      }
+
+      if (ownerIsUpper) {
+        const bottom = clusterBottom(cutGroup, root);
+        if (bottom != null) {
+          const maxEnd = donor.members.length > 0 ? lower.yEnd - 1 : lower.yEnd;
+          upper.yEnd = roundEdge(
+            Math.max(upper.yEnd, Math.min(bottom, maxEnd)),
+          );
+        }
+        lower.yStart = upper.yEnd;
+      } else {
+        const clusterT = clusterTop(cutGroup, root);
+        if (clusterT != null) {
+          const minStart =
+            donor.members.length > 0 ? upper.yStart + 1 : upper.yStart;
+          lower.yStart = roundEdge(
+            Math.min(lower.yStart, Math.max(clusterT, minStart)),
+          );
+        }
+        upper.yEnd = lower.yStart;
+      }
+
+      cut = upper.yEnd;
+
+      if (donor.members.length === 0) {
+        if (ownerIsUpper) upper.yEnd = lower.yEnd;
+        else lower.yStart = upper.yStart;
+        out.splice(ownerIsUpper ? i + 1 : i, 1);
+        if (!ownerIsUpper) i -= 1;
+        break;
+      }
+    }
+  }
+
+  return out.filter((b) => b.members.length > 0);
+}
+
+function remainderSectionName(members: SceneNode[], root: SceneNode): string {
+  const texts = members
+    .filter((m) => m.type === "TEXT" && "characters" in m)
+    .map((m) => ({ m, r: childRootRect(m, root) }))
+    .filter((t) => t.r)
+    .sort((a, b) => a.r!.y - b.r!.y || b.r!.width - a.r!.width);
+  const raw = texts[0]?.m as TextNode | undefined;
+  if (raw && typeof raw.characters === "string") {
+    const line = raw.characters.split("\n")[0].trim();
+    if (line.length > 0 && line.length <= 40) return line;
+  }
+  return "Section";
+}
+
+function sortByChildOrder(
+  members: SceneNode[],
+  childOrder: Map<SceneNode, number>,
+): SceneNode[] {
+  return [...members].sort(
+    (a, b) => (childOrder.get(a) ?? 0) - (childOrder.get(b) ?? 0),
+  );
+}
+
+/**
+ * If a band's full-width solid fill ends while more content continues below
+ * on a different canvas color, split there — that fill edge is the section.
+ */
+function splitBandsAtSectionBackgrounds(
+  bands: BandMembers[],
+  root: SceneNode,
+  rootWidth: number,
+  childOrder: Map<SceneNode, number>,
+): BandMembers[] {
+  const out: BandMembers[] = [];
+
+  for (const band of bands) {
+    const bg = findSectionBackground(band, root, rootWidth);
+    if (!bg) {
+      out.push(band);
+      continue;
+    }
+
+    const bgBottom = bg.rect.y + bg.rect.height;
+    if (bgBottom >= band.yEnd - 48) {
+      out.push(band);
+      continue;
+    }
+
+    const below: SceneNode[] = [];
+    const above: SceneNode[] = [];
+    for (const m of band.members) {
+      if (m === bg.node) {
+        above.push(m);
+        continue;
+      }
+      const r = childRootRect(m, root);
+      const cy = r ? r.y + r.height / 2 : 0;
+      if (r && cy >= bgBottom) below.push(m);
+      else above.push(m);
+    }
+
+    const belowHasBlock =
+      below.some((m) => m.type === "TEXT") || below.length >= 3;
+    if (!belowHasBlock) {
+      out.push(band);
+      continue;
+    }
+
+    out.push({
+      name: band.name,
+      yStart: band.yStart,
+      yEnd: roundEdge(bgBottom),
+      members: sortByChildOrder(above, childOrder),
+    });
+    out.push({
+      name: remainderSectionName(below, root),
+      yStart: roundEdge(bgBottom),
+      yEnd: band.yEnd,
+      members: sortByChildOrder(below, childOrder),
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Shrink a section that still includes whitespace below its solid canvas so the
+ * next section owns that gap. Does not move the cut when content sits on the fill.
+ */
+function snapCutsToBackgrounds(
+  bands: BandMembers[],
+  root: SceneNode,
+  rootWidth: number,
+  childOrder: Map<SceneNode, number>,
+): BandMembers[] {
+  const out: BandMembers[] = bands.map((b) => ({
+    ...b,
+    members: [...b.members],
+  }));
+
+  for (let i = 0; i < out.length - 1; i++) {
+    const upper = out[i];
+    const lower = out[i + 1];
+    const bg = findSectionBackground(upper, root, rootWidth);
+    if (!bg) continue;
+
+    const bgBottom = roundEdge(bg.rect.y + bg.rect.height);
+    if (bgBottom >= upper.yEnd - 4) continue;
+    if (bgBottom <= upper.yStart + 48) continue;
+
+    let lowerTop = Infinity;
+    for (const m of lower.members) {
+      const r = childRootRect(m, root);
+      if (r) lowerTop = Math.min(lowerTop, r.y);
+    }
+    if (lowerTop < bgBottom - 8) continue;
+
+    for (const m of [...upper.members]) {
+      if (m === bg.node) continue;
+      const r = childRootRect(m, root);
+      if (!r) continue;
+      if (r.y + r.height / 2 >= bgBottom) {
+        upper.members = upper.members.filter((x) => x !== m);
+        lower.members.push(m);
+      }
+    }
+
+    upper.yEnd = bgBottom;
+    lower.yStart = bgBottom;
+    upper.members = sortByChildOrder(upper.members, childOrder);
+    lower.members = sortByChildOrder(lower.members, childOrder);
+  }
+
+  return out.filter((b) => b.members.length > 0);
+}
+
+/**
+ * Page = vertical Auto Layout; section frames are flow children (no page-top Y).
+ * Direct children that are not flow sections stay absolute overlays.
+ *
+ * Sibling order IS the stack order. Promoted/reused frames keep their old
+ * layer-panel index (often reverse of visual Y); new shells append at end —
+ * so we always reinsert flow frames in the intended top→bottom order before
+ * enabling Auto Layout. Does not change fills, sizes, or nested structure.
+ */
+export function ensurePageVerticalFlow(
+  page: FrameNode,
+  flowFrames?: FrameNode[],
+): void {
+  const pageW = page.width;
+  const minSectionW = pageW * SECTION_WIDTH_RATIO;
+
+  let sections: FrameNode[];
+  if (flowFrames && flowFrames.length > 0) {
+    sections = flowFrames.filter((s) => s.parent === page);
+  } else {
+    // Full-bleed shells only — ignore narrow décor frames already on the page.
+    // Keep ABSOLUTE out so intentional overlap pins (JOIN vs table) stay pinned;
+    // false pins from décor are prevented in pinOverlappingRootFrames.
+    sections = [...page.children].filter((c) => {
+      if (c.type !== "FRAME" || c.visible === false) return false;
+      if (c.width < minSectionW) return false;
+      if (
+        "layoutPositioning" in c &&
+        (c as FrameNode).layoutPositioning === "ABSOLUTE"
+      ) {
+        return false;
+      }
+      if (isLiftedOverflowOverlay(c)) return false;
+      return true;
+    }) as FrameNode[];
+    // After apply/rollback, prefer page-local Y (band tops) over layer order.
+    sections.sort((a, b) => a.y - b.y || a.x - b.x);
+  }
+  if (sections.length === 0) return;
+
+  reorderPageFlowChildren(page, sections);
+
+  const flowIds = new Set(sections.map((s) => s.id));
+  const pinned = [...page.children]
+    .filter((n) => !flowIds.has(n.id))
+    .map((n) => ({
+      node: n,
+      snap:
+        "absoluteBoundingBox" in n && n.absoluteBoundingBox
+          ? {
+              x: n.absoluteBoundingBox.x,
+              y: n.absoluteBoundingBox.y,
+            }
+          : null,
+      x: "x" in n ? (n as LayoutMixin).x : 0,
+      y: "y" in n ? (n as LayoutMixin).y : 0,
+    }));
+
+  try {
+    page.layoutMode = "VERTICAL";
+    page.primaryAxisSizingMode = "FIXED";
+    page.counterAxisSizingMode = "FIXED";
+    page.primaryAxisAlignItems = "MIN";
+    // CENTER so inset FIXED sections (Mission/Vision 1036, CompanyProfile 1100)
+    // sit in the middle. Full-bleed children use layoutAlign STRETCH and still
+    // fill the page width. Child layoutAlign CENTER often reverts to INHERIT on
+    // GRID frames — parent counter-axis is the reliable lever.
+    page.counterAxisAlignItems = "CENTER";
+    page.paddingTop = 0;
+    page.paddingBottom = 0;
+    page.paddingLeft = 0;
+    page.paddingRight = 0;
+    page.itemSpacing = 0;
+    if ("layoutWrap" in page) page.layoutWrap = "NO_WRAP";
+  } catch (e) {
+    logError(`page Auto Layout failed (${safeNodeRef(page)})`, e);
+    return;
+  }
+
+  for (const { node, snap, x, y } of pinned) {
+    try {
+      let overlay: SceneNode = node;
+      // GROUPs cannot be layoutPositioning ABSOLUTE — they steal vertical flow
+      // space (e.g. empty "Group 7" gap at the top of the page).
+      if (overlay.type === "GROUP") {
+        overlay = convertGroupToFrame(overlay as GroupNode);
+      }
+      if ("layoutPositioning" in overlay) {
+        (overlay as FrameNode).layoutPositioning = "ABSOLUTE";
+      }
+      if (snap) {
+        const pAbs = page.absoluteBoundingBox;
+        if (pAbs && "x" in overlay) {
+          placeLocalBox(overlay, snap.x - pAbs.x, snap.y - pAbs.y);
+        }
+      } else if ("x" in overlay) {
+        (overlay as LayoutMixin).x = x;
+        (overlay as LayoutMixin).y = y;
+      }
+    } catch (e) {
+      logError(`page overlay ABSOLUTE failed (${safeNodeRef(node)})`, e);
+    }
+  }
+
+  for (const section of sections) {
+    try {
+      // Overlapping end blocks (e.g. table vs Join) stay absolute — do not force AUTO.
+      if (
+        "layoutPositioning" in section &&
+        section.layoutPositioning === "ABSOLUTE"
+      ) {
+        continue;
+      }
+      if ("layoutPositioning" in section) {
+        section.layoutPositioning = "AUTO";
+      }
+      section.layoutGrow = 0;
+      section.layoutSizingVertical = "FIXED";
+      if (isSectionGapSpacer(section)) {
+        // Full-bleed transparent band — page background shows through.
+        section.layoutAlign = "STRETCH";
+        section.layoutSizingHorizontal = "FILL";
+        continue;
+      }
+      const nearlyFull = section.width >= page.width * SECTION_FULL_BLEED_RATIO;
+      if (nearlyFull) {
+        section.layoutAlign = "STRETCH";
+        section.layoutSizingHorizontal = "FILL";
+      } else {
+        section.layoutAlign = "CENTER";
+        section.layoutSizingHorizontal = "FIXED";
+      }
+    } catch (e) {
+      logError(`section flow sizing failed (${safeNodeRef(section)})`, e);
+    }
+  }
+
+  // GRID/FIXED children often ignore layoutAlign CENTER (stays INHERIT → x=0).
+  // Wrap inset sections in a full-bleed transparent row that centers them.
+  const contentSections = sections.filter((s) => !isSectionGapSpacer(s));
+  wrapInsetSectionsInCenterBands(page, contentSections);
+  resizePageToFitFlow(page);
+}
+
+/**
+ * Mission/Vision (1036) and CompanyProfile (1100) must stay inset and centered.
+ * Setting layoutAlign/counterAxisAlignItems alone leaves them at x=0 on GRID
+ * shells. A full-width HORIZONTAL band with primaryAxisAlignItems CENTER is
+ * reliable in Figma and converts to `justify-content: center` in HTML.
+ */
+function wrapInsetSectionsInCenterBands(
+  page: FrameNode,
+  sections: FrameNode[],
+): void {
+  const pageW = page.width;
+  for (const section of [...sections]) {
+    try {
+      if (section.parent !== page) continue;
+      if (section.width >= pageW * SECTION_FULL_BLEED_RATIO) continue;
+      if (
+        "layoutPositioning" in section &&
+        section.layoutPositioning === "ABSOLUTE"
+      ) {
+        continue;
+      }
+
+      const w = section.width;
+      const h = Math.max(1, section.height);
+      const shell = figma.createFrame();
+      shell.name = section.name;
+      shell.fills = [];
+      shell.strokes = [];
+      shell.clipsContent = false;
+      shell.resizeWithoutConstraints(Math.max(1, pageW), h);
+      shell.layoutMode = "HORIZONTAL";
+      shell.primaryAxisAlignItems = "CENTER";
+      shell.counterAxisAlignItems = "MIN";
+      shell.primaryAxisSizingMode = "FIXED";
+      shell.counterAxisSizingMode = "FIXED";
+      shell.paddingLeft = 0;
+      shell.paddingRight = 0;
+      shell.paddingTop = 0;
+      shell.paddingBottom = 0;
+      shell.itemSpacing = 0;
+      if ("layoutWrap" in shell) shell.layoutWrap = "NO_WRAP";
+
+      const at = page.children.indexOf(section);
+      if (at < 0) {
+        shell.remove();
+        continue;
+      }
+      page.insertChild(at, shell);
+      shell.appendChild(section);
+
+      section.name = `${section.name} Content`;
+      if ("layoutPositioning" in section) {
+        section.layoutPositioning = "AUTO";
+      }
+      section.layoutSizingHorizontal = "FIXED";
+      section.layoutSizingVertical = "FIXED";
+      section.layoutAlign = "INHERIT";
+      section.layoutGrow = 0;
+      try {
+        section.resize(Math.max(1, w), Math.max(1, h));
+      } catch (e) {
+        logError(`inset content resize failed (${safeNodeRef(section)})`, e);
+      }
+
+      shell.layoutAlign = "STRETCH";
+      shell.layoutSizingHorizontal = "FILL";
+      shell.layoutSizingVertical = "FIXED";
+      shell.layoutGrow = 0;
+    } catch (e) {
+      logError(`inset center band wrap failed (${safeNodeRef(section)})`, e);
+    }
+  }
+}
+
+function isLiftedOverflowOverlay(node: SceneNode): boolean {
+  return (
+    "getPluginData" in node &&
+    typeof (node as FrameNode).getPluginData === "function" &&
+    (node as FrameNode).getPluginData(TIDY_LIFTED_KEY) === "1"
+  );
+}
+
+/**
+ * Paint order: underlays → flow sections → page-absolute overlays.
+ * Plugin-data markers are lost across group→frame / apply rollback, so any
+ * ABSOLUTE non-section child is treated as an overlay (must sit above fills).
+ */
+function reorderPageFlowChildren(
+  page: FrameNode,
+  sectionsInOrder: FrameNode[],
+): void {
+  const flowIds = new Set(
+    sectionsInOrder.filter((s) => s.parent === page).map((s) => s.id),
+  );
+  const nonFlow = [...page.children].filter((n) => !flowIds.has(n.id));
+  const isOverlay = (n: SceneNode) =>
+    isLiftedOverflowOverlay(n) ||
+    ("layoutPositioning" in n &&
+      (n as FrameNode).layoutPositioning === "ABSOLUTE");
+  const underlays = nonFlow.filter((n) => !isOverlay(n));
+  const lifted = nonFlow.filter((n) => isOverlay(n));
+
+  let at = 0;
+  for (const node of underlays) {
+    try {
+      page.insertChild(at, node);
+      at += 1;
+    } catch (e) {
+      logError(`reorder overlay failed (${safeNodeRef(node)})`, e);
+    }
+  }
+  for (const section of sectionsInOrder) {
+    if (section.parent !== page) continue;
+    try {
+      page.insertChild(at, section);
+      at += 1;
+    } catch (e) {
+      logError(`reorder section failed (${safeNodeRef(section)})`, e);
+    }
+  }
+  for (const node of lifted) {
+    try {
+      page.insertChild(at, node);
+      at += 1;
+    } catch (e) {
+      logError(`reorder lifted overlay failed (${safeNodeRef(node)})`, e);
+    }
+  }
+}
+
+function flowPageAsVerticalSections(
+  page: FrameNode,
+  sections: FrameNode[],
+  _unassigned: SceneNode[],
+): void {
+  // `sections` is filledBands order (top→bottom by yStart).
+  liftOverflowDecorations(page, sections);
+  ensurePageVerticalFlow(page, sections);
+}
+
+/**
+ * Decorations that bleed *down* past an unclipped section get covered by the
+ * next section fill in page Auto Layout. Lift those to the page as ABSOLUTE
+ * overlays (world position kept) so they can span section boundaries.
+ *
+ * Do not lift from clipped sections — overflow was never visible in Figma, and
+ * lifting (or HTML overflow:visible) paints the full AABB over the hero
+ * (e.g. Skills Group 514:8970 red terrain covering the samurai).
+ * Upward overflow stays in the later section (it already paints above the previous).
+ */
+export function liftOverflowDecorations(
+  page: FrameNode,
+  sections?: FrameNode[],
+): number {
+  const flowSections =
+    sections && sections.length > 0
+      ? sections.filter((s) => s.parent === page)
+      : ([...page.children].filter(
+          (c) =>
+            c.type === "FRAME" &&
+            !(
+              "layoutPositioning" in c &&
+              (c as FrameNode).layoutPositioning === "ABSOLUTE"
+            ),
+        ) as FrameNode[]);
+
+  let lifted = 0;
+  const pageW = page.width;
+
+  for (const section of flowSections) {
+    const secBox = section.absoluteBoundingBox;
+    if (!secBox) continue;
+    const clips = section.clipsContent === true;
+
+    for (const child of [...section.children] as SceneNode[]) {
+      if (!shouldLiftOverflowDecoration(child, secBox, pageW, clips)) continue;
+      let node: SceneNode = child;
+      try {
+        // Groups can't sit ABSOLUTE in page AL — convert first or they stack in flow.
+        if (node.type === "GROUP") {
+          node = convertGroupToFrame(node as GroupNode);
+        }
+        const snap = node.absoluteBoundingBox;
+        page.appendChild(node);
+        if (snap) {
+          const pAbs = page.absoluteBoundingBox;
+          if (pAbs) {
+            placeLocalBox(node, snap.x - pAbs.x, snap.y - pAbs.y);
+          }
+        }
+        if ("layoutPositioning" in node) {
+          (node as FrameNode).layoutPositioning = "ABSOLUTE";
+        }
+        if ("setPluginData" in node) {
+          (node as FrameNode).setPluginData(TIDY_LIFTED_KEY, "1");
+        }
+        lifted += 1;
+      } catch (e) {
+        logError(`lift overflow decoration failed (${safeNodeRef(child)})`, e);
+      }
+    }
+  }
+
+  if (lifted > 0) {
+    tidyWarn(
+      `Lifted ${lifted} overflowing decoration(s) to page absolute (cross-section bleed)`,
+    );
+  }
+  return lifted;
+}
+
+function shouldLiftOverflowDecoration(
+  node: SceneNode,
+  sectionBox: { x: number; y: number; width: number; height: number },
+  pageWidth: number,
+  sectionClips: boolean,
+): boolean {
+  if (sectionClips) return false;
+  if (node.visible === false) return false;
+  const box = node.absoluteBoundingBox;
+  if (!box) return false;
+
+  // Only downward bleed is covered by the next sibling's fill.
+  const overflowBottom = Math.max(
+    0,
+    box.y + box.height - (sectionBox.y + sectionBox.height),
+  );
+  if (overflowBottom < 8) return false;
+
+  // Full-bleed section canvases stay put (even if they slightly overrun).
+  const nearlyFullWidth = box.width >= pageWidth * 0.9;
+  const nearlySectionHeight = box.height >= sectionBox.height * 0.8;
+  if (nearlyFullWidth && nearlySectionHeight) return false;
+
+  if (node.type === "TEXT") return false;
+  if (node.type === "INSTANCE" || node.type === "COMPONENT") return false;
+
+  if (
+    node.type === "VECTOR" ||
+    node.type === "BOOLEAN_OPERATION" ||
+    node.type === "ELLIPSE" ||
+    node.type === "STAR" ||
+    node.type === "POLYGON" ||
+    node.type === "LINE"
+  ) {
+    return true;
+  }
+
+  if (
+    node.type === "RECTANGLE" ||
+    node.type === "FRAME" ||
+    node.type === "GROUP"
+  ) {
+    // Floating ornaments / masked photos — not full-width bands.
+    return box.width < pageWidth * 0.85;
+  }
+
+  return false;
+}
+
+function isWideSectionShell(node: SceneNode, pageWidth: number): boolean {
+  return "width" in node && node.width >= pageWidth * SECTION_WIDTH_RATIO;
+}
+
+/**
+ * Designer already wrapped the band in one full-width frame — reuse it as the
+ * tidy section instead of nesting Section > OriginalSection > content.
+ */
+function canReuseAsSection(
+  node: SceneNode,
+  pageWidth: number,
+): node is FrameNode {
+  return (
+    node.type === "FRAME" &&
+    node.children.length > 0 &&
+    isWideSectionShell(node, pageWidth)
+  );
+}
+
+/** Keep children on-canvas when moving/resizing a promoted section to the band box. */
+function normalizePromotedSection(
+  section: FrameNode,
+  band: BandMembers,
+  pageWidth: number,
+): void {
+  const bandH = Math.max(1, band.yEnd - band.yStart);
+  const prevX = section.x;
+  const prevY = section.y;
+  const prevW = section.width;
+  // Reused shells between SECTION_WIDTH_RATIO and full bleed (e.g. Mission/Vision
+  // 1036px in a 1280 page) must keep their inset width. Forcing pageWidth grows
+  // GRID FILL children (517→639 cards) and removes the side margins that frame
+  // the white cards against the page background.
+  const keepInset = prevW > 0 && prevW < pageWidth * SECTION_FULL_BLEED_RATIO;
+  const targetW = keepInset ? Math.max(1, prevW) : Math.max(1, pageWidth);
+  try {
+    section.resizeWithoutConstraints(targetW, bandH);
+  } catch (e) {
+    logError(`promote section resize failed (${safeNodeRef(section)})`, e);
+  }
+  section.x = keepInset ? Math.round((pageWidth - targetW) / 2) : 0;
+  section.y = band.yStart;
+  const dx = prevX - section.x;
+  const dy = prevY - section.y;
+  if (dx !== 0 || dy !== 0) {
+    for (const child of [...section.children] as SceneNode[]) {
+      if (!("x" in child)) continue;
+      try {
+        (child as LayoutMixin).x += dx;
+        (child as LayoutMixin).y += dy;
+      } catch (e) {
+        logError(
+          `promote section child shift failed (${safeNodeRef(child)})`,
+          e,
+        );
+      }
+    }
+  }
+}
+
+/** Move group children into the new section frame and drop the redundant group. */
+function flattenGroupIntoSection(group: GroupNode, section: FrameNode): number {
+  const kids = [...group.children] as SceneNode[];
+  let moved = 0;
+  for (const child of kids) {
+    const snap = child.absoluteBoundingBox;
+    try {
+      section.appendChild(child);
+      if (snap) {
+        const sAbs = section.absoluteBoundingBox;
+        if (sAbs) {
+          placeLocalBox(child, snap.x - sAbs.x, snap.y - sAbs.y);
+        }
+      }
+      moved += 1;
+    } catch (e) {
+      logError(`flatten group child failed (${safeNodeRef(child)})`, e);
+    }
+  }
+  try {
+    if (group.parent) group.remove();
+  } catch (e) {
+    logError(`flatten group remove failed (${safeNodeRef(group)})`, e);
+  }
+  return moved;
+}
+
+/**
+ * Wrap direct children into named section frames by vertical band; renames use
+ * getNodeByIdAsync for dynamic-page document access.
+ */
+export async function applyAiSections(
+  root: SceneNode,
+  vision: AiVisionResult,
+  imageHeightPx: number,
+): Promise<AppliedAiSectionsStats> {
+  const t0 = Date.now();
+  if (!("children" in root) || !("width" in root)) {
+    return {
+      sectionCount: 0,
+      assignedCount: 0,
+      unassignedCount: 0,
+      renameApplied: 0,
+      renameSkipped: 0,
+      scaleApplied: null,
+      elapsedMs: Date.now() - t0,
+    };
+  }
+
+  const frame = root as FrameNode;
+  const rootHeight = frame.height;
+  const { result, scale } = maybeScaleAiCoords(
+    vision,
+    rootHeight,
+    imageHeightPx,
+  );
+
+  const bands = buildBands(result.splitLinesY, result.sections, rootHeight);
+  if (bands.length < 2) {
+    const renameStats = await applyRenamesAsync(result.renames);
+    return {
+      sectionCount: 0,
+      assignedCount: 0,
+      unassignedCount: listRootDirectChildren(root).length,
+      ...renameStats,
+      scaleApplied: scale,
+      elapsedMs: Date.now() - t0,
+    };
+  }
+
+  const children = listRootDirectChildren(root);
+  const childOrder = new Map<SceneNode, number>();
+  children.forEach((c, i) => childOrder.set(c, i));
+
+  const assignments = new Map<number, SceneNode[]>();
+  for (let i = 0; i < bands.length; i++) assignments.set(i, []);
+
+  const unassigned: SceneNode[] = [];
+
+  for (const child of children) {
+    // Already-absolute layers should not be pulled into vertical section flow.
+    if (
+      "layoutPositioning" in child &&
+      (child as FrameNode).layoutPositioning === "ABSOLUTE"
+    ) {
+      unassigned.push(child);
+      continue;
+    }
+    const rect = childRootRect(child, root);
+    const cy = childCenterY(child, root);
+    const idx = pickBandIndex(rect, cy, bands);
+    if (idx < 0) {
+      unassigned.push(child);
+      continue;
+    }
+    assignments.get(idx)!.push(child);
+  }
+
+  let assignedCount = 0;
+
+  let filledBands = splitBandsAtSectionBackgrounds(
+    collapseEmptyBands(bands, assignments),
+    root,
+    frame.width,
+    childOrder,
+  );
+  filledBands = healBoundaryCompositions(
+    filledBands,
+    root,
+    frame.width,
+    rootHeight,
+    childOrder,
+  );
+  filledBands = snapCutsToBackgrounds(
+    filledBands,
+    root,
+    frame.width,
+    childOrder,
+  );
+
+  // Capture designer whitespace BEFORE reparent/resize moves shells flush.
+  const sectionGaps = measureBandContentGaps(filledBands, root);
+
+  const sectionNodes: FrameNode[] = [];
+
+  for (const band of filledBands) {
+    const sole = band.members.length === 1 ? band.members[0] : null;
+
+    // Already one full-width section frame → rename/reuse (no extra nest).
+    if (sole && canReuseAsSection(sole, frame.width)) {
+      sole.name = band.name;
+      normalizePromotedSection(sole, band, frame.width);
+      sectionNodes.push(sole);
+      assignedCount += 1;
+      continue;
+    }
+
+    const section = figma.createFrame();
+    section.name = band.name;
+    section.fills = [];
+    // Sections must not clip — decorations bleed across bands by design.
+    section.clipsContent = false;
+    const bandH = Math.max(1, band.yEnd - band.yStart);
+    section.resizeWithoutConstraints(Math.max(1, frame.width), bandH);
+    section.x = 0;
+    // Temporary page-space Y so children convert to section-local; page AL then stacks.
+    section.y = band.yStart;
+
+    frame.appendChild(section);
+    sectionNodes.push(section);
+
+    // Sole full-width group → flatten into section (avoid Section > Group > …).
+    if (
+      sole &&
+      sole.type === "GROUP" &&
+      isWideSectionShell(sole, frame.width) &&
+      sole.children.length > 0
+    ) {
+      assignedCount += flattenGroupIntoSection(sole, section);
+      continue;
+    }
+
+    for (const child of band.members) {
+      // World snap → section-local. Do not subtract section.x from child.x:
+      // GROUP x/y are relative to the nearest FRAME, not the new section parent.
+      const snap = child.absoluteBoundingBox;
+      section.appendChild(child);
+      if (snap && "x" in child) {
+        const sAbs = section.absoluteBoundingBox;
+        if (sAbs) {
+          placeLocalBox(child, snap.x - sAbs.x, snap.y - sAbs.y);
+        }
+      }
+      assignedCount += 1;
+    }
+  }
+
+  const flowedSections = interleaveSectionGapSpacers(
+    frame,
+    sectionNodes,
+    sectionGaps,
+  );
+  flowPageAsVerticalSections(frame, flowedSections, unassigned);
+
+  const renameStats = await applyRenamesAsync(result.renames);
+  // Band names win over layer renames on section roots (reuse would otherwise
+  // become "Message Section" again after promote).
+  for (let i = 0; i < sectionNodes.length; i++) {
+    try {
+      sectionNodes[i].name = filledBands[i].name;
+    } catch (e) {
+      logError(
+        `section rename re-assert failed (${safeNodeRef(sectionNodes[i])})`,
+        e,
+      );
+    }
+  }
+  const elapsedMs = Date.now() - t0;
+
+  return {
+    sectionCount: filledBands.length,
+    assignedCount,
+    unassignedCount: unassigned.length,
+    ...renameStats,
+    scaleApplied: scale,
+    elapsedMs,
+  };
+}
+
+export async function applyRenamesAsync(
+  renames: Record<string, string>,
+): Promise<{ renameApplied: number; renameSkipped: number }> {
+  let renameApplied = 0;
+  let renameSkipped = 0;
+
+  for (const [id, name] of Object.entries(renames)) {
+    let node: BaseNode | null = null;
+    try {
+      node = await figma.getNodeByIdAsync(id);
+    } catch (e) {
+      logError(`getNodeByIdAsync failed for rename ${id}`, e);
+      renameSkipped += 1;
+      continue;
+    }
+    if (!node) {
+      renameSkipped += 1;
+      continue;
+    }
+    try {
+      if (node.type === "DOCUMENT" || node.type === "PAGE") {
+        renameSkipped += 1;
+        continue;
+      }
+      node.name = name;
+      renameApplied += 1;
+    } catch (e) {
+      logError(`rename failed for ${id}`, e);
+      renameSkipped += 1;
+    }
+  }
+
+  return { renameApplied, renameSkipped };
+}

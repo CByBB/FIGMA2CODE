@@ -1,342 +1,151 @@
 # Logic
 
-How Figma to Code turns a Figma selection into HTML + CSS **and** a downloadable ZIP of JSON + assets. This document describes the runtime pipeline and messaging — not setup steps (see [Developer Guide](./user-guide.md)).
+How the plugin turns a Figma selection into HTML and a ZIP. Skim the diagrams first.
 
 ---
 
-## High-level architecture
-
-```mermaid
-flowchart TB
-  subgraph Figma["Figma host"]
-    Canvas["Canvas selection / document"]
-    Sandbox["Plugin main thread<br/>src/plugin.ts"]
-    UI["Plugin iframe UI<br/>src/ui"]
-  end
-
-  subgraph Source["src/"]
-    Convert["convert / export"]
-    Types["types/"]
-  end
-
-  Canvas --> Sandbox
-  Sandbox --> Convert
-  Convert --> Types
-  UI --> Types
-  Sandbox <-->|"postMessage"| UI
-```
-
-| Path            | Role                                                              |
-| --------------- | ----------------------------------------------------------------- |
-| `src/plugin.ts` | Entry: settings, selection listeners, codegen mode, calls `run()` |
-| `src/convert/`  | Node processing + HTML + CSS emitter                              |
-| `src/export/`   | Asset ZIP                                                         |
-| `src/tidy/`     | Phase 1: clone + infer Auto Layout before convert                 |
-| `src/ui/`       | Panel: code, ZIP download, colors                                 |
-| `src/types/`    | Shared `PluginSettings`, messages, and node types                 |
-
----
-
-## Plugin modes
-
-Figma launches the plugin in different modes (`figma.mode`).
+## What the user does
 
 ```mermaid
 flowchart LR
-  Start["figma.mode"] --> Default["default / inspect"]
-  Start --> Codegen["codegen"]
-
-  Default --> Standard["standardMode()"]
-  Standard --> ShowUI["showUI + init settings"]
-  Standard --> Listen["selectionchange"]
-  Standard --> SafeRun["safeRun(settings)"]
-
-  Codegen --> CG["codegenMode()"]
-  CG --> OnGen["figma.codegen.on('generate')"]
-  OnGen --> NodesJSON["nodesToJSON"]
-  OnGen --> Emit["framework Main()"]
+  A["Select layers<br/>in Figma"] --> B["Open plugin"]
+  B --> C{"What next?"}
+  C --> D["Read code preview"]
+  C --> E["Download ZIP"]
+  C --> F["Tidy + Convert<br/>(needs API key)"]
 ```
 
-- **default / inspect** — visible panel; ZIP + live conversion on selection and setting changes.
-- **codegen** — Dev Mode languages from `manifest.json`; returns `CodegenResult[]` (code + extras). Codegen path does not build the ZIP package.
+| Action                    | Result                                                |
+| ------------------------- | ----------------------------------------------------- |
+| Select / change selection | Live HTML preview updates (no image export yet)       |
+| Download ZIP              | Full `index.html` + images/SVGs + JSON                |
+| Tidy + Convert            | Clone → AI sections → Auto Layout tidy → then convert |
+| About → Save key          | Enables Tidy + Convert                                |
 
 ---
 
-## End-to-end conversion pipeline
-
-Core orchestration lives in `src/convert/run.ts` (`run`).
+## UX flow
 
 ```mermaid
 flowchart TD
-  A["run(settings)"] --> B{"selection empty?"}
-  B -->|yes| Empty["postEmptyMessage"]
-  B -->|no| Conv["nodesToJSON + buildZipIndexHtml"]
-  Conv --> Colors["retrieve colors and gradients"]
-  Colors --> Done["postConversionComplete (code only)"]
+  Start["Plugin opens"] --> Ready["UI ready"]
+  Ready --> Key{"API key saved?"}
+  Key -->|yes| TidyOn["Tidy + Convert enabled"]
+  Key -->|no| TidyOff["Tidy disabled<br/>paste key in About"]
 
-  Z["UI: Download ZIP"] --> Zip["exportZipPackage"]
-  Zip --> Assets["exportZipAssets → stream zipFile"]
-  Assets --> Html["reuse lastPreviewHtml or rebuild"]
-  Html --> Ready["zipDone → UI builds ZIP"]
+  Ready --> Sel{"Selection?"}
+  Sel -->|empty| Empty["Show empty state"]
+  Sel -->|has layers| Conv["Convert → code preview"]
+
+  Conv --> Panel["Code panel + colors"]
+  Panel --> ZipBtn["User: Download ZIP"]
+  ZipBtn --> Stream["Export assets one by one"]
+  Stream --> DL["Browser downloads ZIP"]
+
+  TidyOn --> TidyBtn["User: Tidy + Convert"]
+  TidyBtn --> Clone["Clone to the right"]
+  Clone --> AI["AI splits sections"]
+  AI --> Layout["Infer Auto Layout"]
+  Layout --> Conv
 ```
-
-Selection / settings changes run **code preview only** (planned `assets/*` paths, no `exportAsync` for images). Asset bytes stream to the UI **only when the user clicks Download ZIP**. The panel receives an HTML snippet; the full document stays in the main thread.
-
-### ZIP package
-
-```text
-export.zip
-  index.html          # Static HTML preview (relative asset URLs)
-  figma_raw.json      # REST-shaped tree for offline use
-  assets_map.json     # node id → asset path + flags
-  assets/*.{svg,png}
-```
-
-Open `index.html` after extracting the ZIP to view a design-faithful HTML render that loads images/SVGs from `assets/`.
-
-Accuracy rules (ported for fidelity):
-
-| Rule                     | Behavior                                                         |
-| ------------------------ | ---------------------------------------------------------------- |
-| IMAGE fills              | Framed `exportAsync` PNG (not CSS `background-image` alone)      |
-| Vectors / shapes / icons | Baked SVG (`exportAsync` SVG)                                    |
-| Effects on export        | Unclip ancestors while exporting; mark `effectsBaked`            |
-| Conversion reuse         | Preview plans paths only; ZIP streams each file then drops bytes |
-| CSS shadows              | Skip `box-shadow` when `effectsBaked` so shadows are not doubled |
-
-UI: **Download ZIP** streams one file per `zipFile` message; `src/ui/zip.ts` builds the archive on `zipDone` and clears the buffers.
-
-`safeRun` serializes runs (`isBusy`). Selection changes are debounced (~400ms). `documentchange` is not registered because `documentAccess: "dynamic-page"` would require `figma.loadAllPagesAsync()` first.
 
 ---
 
-## Tidy + Convert (Phase 1)
-
-Button-only path (`tidyAndConvert`). Does **not** run on every `selectionchange`.
+## Two ways to get HTML
 
 ```mermaid
 flowchart TD
-  UI["UI: Tidy + Convert"] --> Msg["plugin.ts: tidyAndConvert"]
-  Msg --> Guard["isBusy + isTidying"]
-  Guard --> Target["resolve selection or page"]
-  Target --> Clone["clone to the right of original"]
-  Clone --> Plan["buildTidyPlan"]
-  Plan --> Apply["applyTidyPlan on clone"]
-  Apply --> Sel["select clone"]
-  Sel --> Run["run() existing converter"]
-```
-
-### Behavior
-
-1. Resolves target: current selection, or (if empty) all visible top-level layers on the current page.
-2. Clones onto the current page, placed to the right of the original bbox (`gap = 80`). Name: `{original} / tidied`.
-3. Plugin data links source ↔ clone (`tidySourceId` / `tidyCloneId`). Re-running replaces the previous clone.
-4. Infers Auto Layout on **freeform** frames/groups in the clone only; original is untouched.
-5. Selects the clone and runs the normal HTML converter.
-
-### Skip rules
-
-| Case                                        | Behavior                                                                 |
-| ------------------------------------------- | ------------------------------------------------------------------------ |
-| Already Auto Layout (`layoutMode !== NONE`) | Do not change that frame’s layout props; still tidy freeform descendants |
-| `INSTANCE`                                  | Keep linked; treat as leaf (no detach, no inner tidy)                    |
-| `COMPONENT` main                            | Build a FRAME copy of children (do not mutate the main)                  |
-| `GROUP`                                     | Convert to FRAME (or unwrap single-child empty groups), then infer       |
-| Rotated / overlapping decorative / overlays | Prefer `layoutPositioning = ABSOLUTE` over a wrong flex stack            |
-| Codegen mode                                | No tidy                                                                  |
-
-Inference lives in `src/tidy/infer.ts` (plan only); Figma writes live in `src/tidy/apply.ts` and `src/tidy/clone.ts`.
-
-### Phase 2 (not implemented)
-
-Keep `TidyPlan` / infer. Stop showing a canvas sibling — either hide/remove the clone after `nodesToJSON`, or apply the plan onto the REST JSON tree with no canvas write so poor design → structured HTML looks direct.
-
----
-
-## Node conversion (`nodesToJSON`)
-
-Modern path: `src/convert/nodes/toJson.ts`.
-
-```mermaid
-flowchart TD
-  Sel["SceneNode[] selection"] --> Exp["exportAsync JSON_REST_V1"]
-  Exp --> Doc["REST document tree"]
-  Doc --> Fix["GROUP → FRAME<br/>normalize rotation"]
-  Fix --> Pair["processNodePair(json, figmaNode, settings)"]
-  Pair --> Enrich["Enrich with live API data"]
-  Enrich --> Flags["applyAssetFlagsToTree from cache"]
-  Flags --> Out["Alt / processed Node[]"]
-
-  subgraph EnrichDetail["Per-node enrichment"]
-    V["Visibility / layout geometry"]
-    C["Color variables → names"]
-    T["Styled text segments"]
-    I["Icon detection / flatten hints"]
-    P["Parent refs for layout"]
+  subgraph Fast["Everyday"]
+    S1["Select"] --> C1["Convert"]
+    C1 --> P1["Preview code"]
+    P1 --> Z1["Optional: ZIP"]
   end
 
-  Pair --> EnrichDetail
+  subgraph Tidied["When layout is messy"]
+    S2["Select"] --> K["API key"]
+    K --> T["Tidy + Convert"]
+    T --> C2["Convert clone"]
+    C2 --> P2["Preview + ZIP"]
+  end
 ```
 
-Why two sources?
-
-1. **JSON_REST_V1** — stable serializable tree (fills, layout props, hierarchy).
-2. **Live `SceneNode`** — async APIs (`getStyledTextSegments`, variables, export) that REST alone does not fully cover.
-
-Groups are treated as frames; child rotations are adjusted so layout math stays consistent. An older path (`oldConvertNodesToAltNodes`) remains behind `useOldPluginVersion2025` for regression comparison.
-
-**Typing note:** `nodesToJSON` returns REST `Node[]`. Framework emitters are typed for plugin `SceneNode[]`. Call sites bridge with a cast (`as unknown as SceneNode[]` in codegen) or `any` in `run()` — the trees are structurally the same enriched shapes.
+- **Everyday** — convert what is on the canvas as-is.
+- **Tidied** — make a structured clone first (sections, gaps, Auto Layout), leave the original alone, convert the clone.
 
 ---
 
-## HTML + CSS generation
-
-`run` always builds HTML through `htmlMain` with `lockedHtmlSettings` (layer names, color variables, `assets/*` paths). Preview and ZIP `index.html` share that document.
-
-```mermaid
-flowchart LR
-  In["processed Node[] + PluginSettings"] --> HT["htmlMain"]
-  HT --> Code["HTML + inline CSS"]
-```
-
-Each `*Main` walks the tree and uses builder modules for:
-
-- Auto layout → flex / stack / row-column
-- Freeform → absolute positioning
-- Size, padding, border radius
-- Fills, strokes, effects, blend
-- Text (typography segments)
-- Image Base64 / SVG embed (forced on in `run`)
-
-The panel shows **code + ZIP** only. `generateHTMLPreview` may still exist in `generate.ts` for legacy/compat types, but the UI no longer renders an HTML preview.
-
----
-
-## Messaging contract
-
-UI and main thread talk over `postMessage`. Types live in `src/types/`.
-
-```mermaid
-sequenceDiagram
-  participant UI as Plugin UI
-  participant Main as Plugin main
-  participant Backend as convert.run
-
-  UI->>Main: ui-ready
-  Main->>Main: load clientStorage settings
-  Main->>UI: pluginSettingsChanged
-  Main->>Backend: run(settings)
-  Backend->>UI: conversionStart
-  Backend->>UI: codePreview snippet | empty | error
-
-  Note over Main: selectionchange debounce
-  Main->>Backend: safeRun(settings)
-
-  UI->>Main: exportZip
-  Backend->>UI: zipFile per asset
-  Backend->>UI: zipDone
-
-  UI->>Main: requestFullCode
-  Main->>UI: fullCode once
-```
-
-| Direction | `type`                    | Meaning                                             |
-| --------- | ------------------------- | --------------------------------------------------- |
-| UI → Main | `ui-ready`                | Handshake; init once                                |
-| UI → Main | `pluginSettingWillChange` | Preference update                                   |
-| UI → Main | `exportZip`               | Start streamed ZIP export                           |
-| UI → Main | `tidyAndConvert`          | Clone + Auto Layout tidy, then convert the clone    |
-| UI → Main | `requestFullCode`         | Copy or expand the full HTML document               |
-| UI → Main | `get-selection-json`      | Debug dump of REST + conversion                     |
-| Main → UI | `pluginSettingsChanged`   | Full settings push                                  |
-| Main → UI | `conversionStart`         | Loading / status reset                              |
-| Main → UI | `progress`                | Status text (tidy or ZIP export)                    |
-| Main → UI | `code`                    | HTML snippet + counts (full document stays in main) |
-| Main → UI | `zipFile` / `zipDone`     | One ZIP file, then assemble + download              |
-| Main → UI | `fullCode`                | One-shot full HTML for copy or Show more            |
-| Main → UI | `empty`                   | No selection / nothing convertible                  |
-| Main → UI | `error`                   | Fatal user-facing error                             |
-
-The panel does not keep the full HTML or ZIP bytes in React state. `htmlPreview` on the message type is deprecated and unused.
-
----
-
-## Settings model
-
-`PluginSettings` is HTML-only. Defaults are set in `src/plugin.ts` and persisted in `figma.clientStorage` under `userPluginSettings`.
-
-In `run()`, `embedImages` and `embedVectors` are **forced `true`** so ZIP-backed embeds stay accurate even if UI toggles differ.
-
-```mermaid
-classDiagram
-  class PluginSettings {
-    showLayerNames
-    useColorVariables
-    embedImages
-    embedVectors
-    useOldPluginVersion2025
-    responsiveRoot
-    relativeAssetPaths
-  }
-  PluginSettings --> HTMLSettings
-```
-
-Export settings are locked in `src/convert/settings.ts` (layer names on, color variables on, images/vectors as `assets/*`).
-
----
-
-## Build data flow
-
-```mermaid
-flowchart LR
-  Plugin["src/plugin.ts"] --> DistJS["dist/code.js"]
-  UI["src/ui"] --> DistHTML["dist/index.html"]
-  DistJS --> Manifest["manifest.json"]
-  DistHTML --> Manifest
-  Manifest --> Figma["Figma loads plugin"]
-```
-
-esbuild/Vite assemble the plugin into root `dist/`; Figma only loads those artifacts referenced by `manifest.json`.
-
----
-
-## Hard cases (design decisions)
+## Conversion logic (big picture)
 
 ```mermaid
 flowchart TD
-  Layout["Mixed absolute + auto-layout"] --> Decide["Infer parent-child & z-order"]
-  Decide --> CodeLayout["Emit absolute offsets or flex as appropriate"]
-
-  Vars["Bound color variables"] --> MapName["Map id → CSS color name"]
-  MapName --> PreferVar["Prefer variable tokens when useColorVariables"]
-
-  FX["Gradients / effects"] --> HTML["HTML CSS builders"]
-  HTML --> Warn["addWarning if unsupported"]
-
-  Assets["Vectors / images"] --> ZipFirst["ZIP export on download"]
-  ZipFirst --> Paths["assets/* paths in HTML"]
-  ZipFirst --> Flags["effectsBaked / framed image flags"]
-  Flags --> SkipDup["Skip CSS box-shadow when baked"]
+  Sel["Selection"] --> Tree["Read layer tree"]
+  Tree --> Enrich["Fill gaps<br/>size, text, colors, assets"]
+  Enrich --> Layout{"How is it laid out?"}
+  Layout -->|Auto Layout row/column| Flex["CSS flex"]
+  Layout -->|Grid| Grid["CSS grid"]
+  Layout -->|Freeform / group box| Abs["Absolute left/top"]
+  Flex --> HTML["HTML + inline CSS"]
+  Grid --> HTML
+  Abs --> HTML
+  HTML --> Preview["Preview snippet"]
+  HTML --> Zip["ZIP index.html<br/>when user downloads"]
 ```
-
-Warnings are accumulated in a module-level set (`src/convert/warnings.ts`) and returned with the conversion payload so the UI can surface them without failing the whole run.
 
 ---
 
-## Key source map
+## What goes in the ZIP
 
-| Concern                | Location                                     |
-| ---------------------- | -------------------------------------------- |
-| Plugin entry & modes   | `src/plugin.ts`                              |
-| Orchestration `run`    | `src/convert/run.ts`                         |
-| Tidy + Auto Layout     | `src/tidy/`                                  |
-| ZIP + asset export     | `src/export/zip.ts`                          |
-| Asset cache / flags    | `src/export/cache.ts`, `src/export/flags.ts` |
-| JSON → processed nodes | `src/convert/nodes/toJson.ts`                |
-| Static HTML document   | `src/export/html.ts`                         |
-| HTML codegen           | `src/convert/html/generate.ts`               |
-| Locked export settings | `src/convert/settings.ts`                    |
-| Plugin → UI messages   | `src/messaging.ts`                           |
-| Panel + ZIP / Tidy     | `src/ui/PluginUI.tsx`                        |
-| ZIP download helper    | `src/ui/zip.ts`                              |
-| Types                  | `src/types/`                                 |
+```mermaid
+flowchart LR
+  HTML["index.html"] --> Open["Open in browser"]
+  Assets["assets/* images & SVGs"] --> Open
+  Raw["figma_raw.json"] --> Offline["Offline / debug"]
+  Map["assets_map.json"] --> Offline
+```
+
+Preview and ZIP share the same HTML document. Images are only exported when you download the ZIP.
+
+---
+
+## Tidy + Convert logic
+
+```mermaid
+flowchart TD
+  Go["Tidy + Convert"] --> Clone["Clone selection<br/>place to the right"]
+  Clone --> Shot["Screenshot + layer list"]
+  Shot --> AI["AI: section breaks & names"]
+  AI --> Gaps["Keep empty space<br/>between sections"]
+  Gaps --> AL["Infer Auto Layout<br/>where it is safe"]
+  AL --> Pick["Select the clone"]
+  Pick --> Conv["Same convert as everyday"]
+```
+
+Original design is never modified. Re-run replaces the previous clone.
+
+---
+
+## Layout rules (when HTML looks wrong)
+
+```mermaid
+flowchart TD
+  Q1["Group inside Auto Layout?"] -->|yes| Keep["Keep as one box<br/>children absolute inside"]
+  Q1 -->|no| Flat["Unwrap group<br/>children join parent"]
+
+  Q2["Image/SVG clipped by parent?"] -->|yes| Full["Use full frame size<br/>not the clipped box"]
+  Q2 -->|no shadow overflow| Bigger["Use larger paint box"]
+
+  Q3["Padding almost as big as the frame?"] -->|yes| Drop["Ignore that padding"]
+  Q3 -->|no| KeepPad["Emit padding"]
+```
+
+These rules keep pages from collapsing sideways (sidebar + footer only), squashing wide background images, or crushing buttons with bad import padding.
+
+---
+
+## Modes
+
+```mermaid
+flowchart LR
+  Mode["Figma mode"] --> UI["Normal plugin UI<br/>preview + ZIP + tidy"]
+  Mode --> Codegen["Dev Mode codegen<br/>code only, no ZIP"]
+```

@@ -1,3 +1,4 @@
+// Builds style/data attributes for a single node (position, fills, borders, shadows).
 import { formatWithJSX } from "../css/format";
 import { htmlShadow } from "./shadow";
 import {
@@ -10,17 +11,25 @@ import { buildBackgroundValues, htmlColorFromFills } from "./color";
 import { htmlPadding } from "./padding";
 import { htmlSizePartial } from "./size";
 import { htmlBorderRadius } from "./borderRadius";
+import { htmlGridChildProps, htmlCrossAxisAlign } from "./autoLayout";
 import {
   commonIsAbsolutePosition,
   getCommonPositionValue,
 } from "../layout/position";
+import {
+  commonLetterSpacing,
+  commonLineHeight,
+  textBoxLooksMultiline,
+  textContentExceedsLayoutWidth,
+} from "../layout/text";
+import { textOverflowsLayoutBox } from "../layout/bakeLines";
 import { numberToFixedString, stringToClassName } from "../css/numbers";
-import { commonStroke } from "../layout/stroke";
 import {
   formatClassAttribute,
   formatDataAttribute,
   formatStyleAttribute,
 } from "../css/attributes";
+import { commonStroke } from "../layout/stroke";
 import { HTMLSettings } from "types";
 
 export class HtmlDefaultBuilder {
@@ -57,7 +66,13 @@ export class HtmlDefaultBuilder {
     this.size();
     this.autoLayoutPadding();
     this.position();
+    this.gridChild();
     this.blend();
+    return this;
+  }
+
+  gridChild(): this {
+    this.addStyles(...htmlGridChildProps(this.node));
     return this;
   }
 
@@ -82,7 +97,7 @@ export class HtmlDefaultBuilder {
     const { node, isJSX } = this;
     this.addStyles(
       htmlVisibility(node, isJSX),
-      ...htmlRotation(node as LayoutMixin, isJSX),
+      ...htmlRotation(node, isJSX),
       htmlOpacity(node as MinimalBlendMixin, isJSX),
       htmlBlendMode(node as MinimalBlendMixin, isJSX),
     );
@@ -108,7 +123,6 @@ export class HtmlDefaultBuilder {
 
     const strokeAlign = "strokeAlign" in node ? node.strokeAlign : "INSIDE";
 
-    // Function to create border value string
     const consolidateBorders = (border: number): string =>
       [`${numberToFixedString(border)}px`, color, borderStyle]
         .filter((d) => d)
@@ -120,7 +134,18 @@ export class HtmlDefaultBuilder {
       }
       const weight = commonBorder.all;
 
-      if (
+      // INSIDE + strokesIncludedInLayout: stroke is part of the frame size and
+      // shrinks the content box (hero white matte). CSS border + border-box
+      // matches; inset outline paints over the image and drops the extra size.
+      const strokesInLayout =
+        "strokesIncludedInLayout" in node &&
+        (node as FrameNode).strokesIncludedInLayout === true;
+      if (strokeAlign === "INSIDE" && strokesInLayout) {
+        this.addStyles(
+          formatWithJSX("box-sizing", this.isJSX, "border-box"),
+          formatWithJSX("border", this.isJSX, consolidateBorders(weight)),
+        );
+      } else if (
         strokeAlign === "CENTER" ||
         strokeAlign === "OUTSIDE" ||
         node.type === "FRAME" ||
@@ -148,13 +173,13 @@ export class HtmlDefaultBuilder {
           );
         }
       } else {
-        // Default: use regular border on autolayout + strokeAlign: inside
+        // INSIDE stroke on non-frame shapes maps cleanly to border.
         this.addStyles(
           formatWithJSX("border", this.isJSX, consolidateBorders(weight)),
         );
       }
     } else {
-      // For non-uniform borders, always use individual border properties
+      // Per-side weights need individual border-* properties.
       if (commonBorder.left !== 0) {
         this.addStyles(
           formatWithJSX(
@@ -210,6 +235,28 @@ export class HtmlDefaultBuilder {
       if (node.type === "GROUP" || (node as any).isRelative) {
         this.addStyles(formatWithJSX("position", isJSX, "relative"));
       }
+
+      // Fixed-size AL children must not flex-shrink when a sibling's padding
+      // (or rounding) makes the column taller than the page — that compresses
+      // section frames while absolute décor keeps its top offset.
+      const parent = node.parent;
+      const grows =
+        "layoutGrow" in node &&
+        typeof (node as LayoutMixin).layoutGrow === "number" &&
+        (node as LayoutMixin).layoutGrow > 0;
+      if (
+        !grows &&
+        parent &&
+        "layoutMode" in parent &&
+        parent.layoutMode &&
+        parent.layoutMode !== "NONE" &&
+        parent.layoutMode !== "GRID"
+      ) {
+        this.addStyles(formatWithJSX("flex-shrink", isJSX, "0"));
+      }
+
+      // FIXED inset bands (Mission/Vision) need align-self:center in a column.
+      this.addStyles(...htmlCrossAxisAlign(node, isJSX));
     }
 
     return this;
@@ -234,7 +281,6 @@ export class HtmlDefaultBuilder {
     if (backgroundValues) {
       this.addStyles(formatWithJSX("background", this.isJSX, backgroundValues));
 
-      // Add blend mode property if multiple fills exist with different blend modes
       if (paintArray !== figma.mixed) {
         const blendModes = this.buildBackgroundBlendModes(paintArray);
         if (blendModes) {
@@ -258,7 +304,7 @@ export class HtmlDefaultBuilder {
       return "";
     }
 
-    // Reverse the array to match the background order
+    // Match buildBackgroundValues paint reversal so blend modes align with layers.
     const blendModes = [...paintArray].reverse().map((paint) => {
       if (paint.blendMode === "PASS_THROUGH") {
         return "normal";
@@ -286,22 +332,135 @@ export class HtmlDefaultBuilder {
     const { width, height, constraints } = htmlSizePartial(node, false);
 
     if (node.type === "TEXT") {
-      switch (node.textAutoResize) {
-        case "WIDTH_AND_HEIGHT":
-          break;
-        case "HEIGHT":
-          this.addStyles(width);
-          break;
-        case "NONE":
-        case "TRUNCATE":
-          this.addStyles(width, height);
-          break;
+      const text = node as TextNode;
+      const chars = "characters" in text ? String(text.characters) : "";
+      const noHardBreak = !chars.includes("\n");
+      const fontSize = typeof text.fontSize === "number" ? text.fontSize : 0;
+
+      let lineHeightPx = fontSize > 0 ? fontSize * 1.2 : 0;
+      try {
+        if (
+          text.lineHeight &&
+          text.lineHeight !== figma.mixed &&
+          fontSize > 0
+        ) {
+          const lh = commonLineHeight(text.lineHeight as LineHeight, fontSize);
+          if (lh > 0) lineHeightPx = lh;
+        }
+      } catch {
+        /* mixed lineHeight */
+      }
+      const fromStyle = (text as TextNode & { lineHeightPx?: number })
+        .lineHeightPx;
+      if (typeof fromStyle === "number" && fromStyle > 0) {
+        lineHeightPx = fromStyle;
+      }
+
+      let letterSpacingPx = 0;
+      try {
+        if (
+          text.letterSpacing &&
+          text.letterSpacing !== figma.mixed &&
+          fontSize > 0
+        ) {
+          letterSpacingPx = commonLetterSpacing(
+            text.letterSpacing as LetterSpacing,
+            fontSize,
+          );
+        }
+      } catch {
+        /* mixed letterSpacing */
+      }
+      const fromLs = (text as TextNode & { letterSpacing?: number })
+        .letterSpacing;
+      if (
+        letterSpacingPx === 0 &&
+        typeof fromLs === "number" &&
+        Number.isFinite(fromLs)
+      ) {
+        letterSpacingPx = fromLs;
+      }
+
+      // Prefer Figma-baked visual `\n` (toJson). Fallback: tall box without `\n`
+      // still allows CSS soft-wrap when baking was skipped (missing font, etc.).
+      const textMeta = text as TextNode & {
+        visualLineBreaksBaked?: boolean;
+        textPaintOverflows?: boolean;
+        textPaintHeight?: number;
+      };
+      const baked = !!textMeta.visualLineBreaksBaked;
+      const overflowsBox =
+        !!textMeta.textPaintOverflows || textOverflowsLayoutBox(text);
+      // Content wider than the box must wrap even when AABB/paint height still
+      // looks like one line (master-course「いまお…」597×69 / nowrap overflow).
+      const contentWiderThanBox = textContentExceedsLayoutWidth(
+        chars,
+        typeof text.width === "number" ? Math.abs(text.width) : 0,
+        fontSize,
+        letterSpacingPx,
+      );
+      const clippedMultilineBody =
+        contentWiderThanBox &&
+        textBoxLooksMultiline(
+          typeof text.height === "number" ? Math.abs(text.height) : 0,
+          fontSize,
+          lineHeightPx,
+        );
+      // Wider-than-box *and* taller-than-one-line copy gets baked <br/> +
+      // nowrap. Single-line Latin labels (Exercise 22px) stay nowrap, no <br/>.
+      const softWrapParagraph =
+        !baked &&
+        noHardBreak &&
+        fontSize > 0 &&
+        !clippedMultilineBody &&
+        (overflowsBox ||
+          text.height > Math.max(fontSize * 2.5, lineHeightPx * 1.5));
+
+      // Keep Figma width (+ small webfont pad). Never estimate a wider box from
+      // AABB height/lineHeight — that turned Gerber 583px into ~1037px.
+      // Soft-wrap fallback (no bake): skip pad so CSS does not wrap later than
+      // Figma and run under overlapping siblings (master-course book card).
+      let widthStyle = width;
+      if (typeof text.width === "number") {
+        let outW = Math.abs(text.width);
+        const allowPad = baked || clippedMultilineBody || !softWrapParagraph;
+        if (allowPad) {
+          let pad = 2;
+          if (letterSpacingPx > 0) pad = Math.max(pad, letterSpacingPx);
+          if (fontSize > 0) {
+            pad = Math.max(pad, Math.ceil(fontSize * 0.25));
+          }
+          pad = Math.max(pad, Math.ceil(outW * 0.02));
+          outW += pad;
+        }
+        // Baked / clipped multiline: tiny slack only — do not grow to full advance.
+        if ((baked || clippedMultilineBody) && fontSize > 0) {
+          outW = Math.max(
+            Math.abs(text.width) + 2,
+            Math.min(outW, Math.abs(text.width) + Math.ceil(fontSize * 0.5)),
+          );
+        }
+        widthStyle = formatWithJSX("width", this.isJSX, Math.max(1, outW));
+      }
+
+      // Height: keep Figma layout AABB. Vertical-align (center) + overflow
+      // visible matches canvas paint. Inflating to paintH or lineCount×lh
+      // (BPS 240px) overlaps the next absolute paragraph.
+      this.addStyles(widthStyle, height);
+
+      // Pixel-perfect: baked or content-wider (emit <br/>) must not reflow.
+      if (
+        baked ||
+        clippedMultilineBody ||
+        (noHardBreak && !softWrapParagraph)
+      ) {
+        this.addStyles(formatWithJSX("white-space", this.isJSX, "nowrap"));
       }
     } else {
       this.addStyles(width, height);
     }
 
-    // Add constraints as separate styles
+    // min/max width/height are separate from computed width/height strings.
     if (constraints.length > 0) {
       this.addStyles(...constraints);
     }
@@ -321,7 +480,7 @@ export class HtmlDefaultBuilder {
     const { node } = this;
     if ("effects" in node && node.effects.length > 0) {
       const blur = node.effects.find(
-        (e) => e.type === "LAYER_BLUR" && e.visible,
+        (e): e is BlurEffect => e.type === "LAYER_BLUR" && e.visible !== false,
       );
       if (blur) {
         this.addStyles(
@@ -334,7 +493,8 @@ export class HtmlDefaultBuilder {
       }
 
       const backgroundBlur = node.effects.find(
-        (e) => e.type === "BACKGROUND_BLUR" && e.visible,
+        (e): e is BlurEffect =>
+          e.type === "BACKGROUND_BLUR" && e.visible !== false,
       );
       if (backgroundBlur) {
         this.addStyles(

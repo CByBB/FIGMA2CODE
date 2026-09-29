@@ -1,3 +1,5 @@
+/** Classifies frame children into layout roles before Auto Layout inference. */
+
 import {
   ALIGN_EPS,
   BG_COVER_RATIO,
@@ -69,6 +71,66 @@ export function isPlainFillShape(node: SceneNode): boolean {
   return true;
 }
 
+/** Vectors/shapes that stack into a composite icon rather than page chrome. */
+export function isDecorativeLayer(node: SceneNode): boolean {
+  return (
+    node.type === "VECTOR" ||
+    node.type === "BOOLEAN_OPERATION" ||
+    node.type === "STAR" ||
+    node.type === "POLYGON" ||
+    node.type === "LINE" ||
+    node.type === "ELLIPSE" ||
+    node.type === "RECTANGLE"
+  );
+}
+
+function siblingsSitInside(cover: ChildGeom, others: ChildGeom[]): boolean {
+  if (others.length === 0) return false;
+  return others.every((o) =>
+    containsPoint(cover.rect, rectCenterX(o.rect), rectCenterY(o.rect)),
+  );
+}
+
+/** Nested GROUP/FRAME of only decorative shapes is still a stacked icon piece. */
+function isDecorativeOrIconGroup(node: SceneNode): boolean {
+  if (isDecorativeLayer(node)) return true;
+  if (
+    (node.type === "GROUP" || node.type === "FRAME") &&
+    "children" in node &&
+    node.children.length > 0 &&
+    node.children.every((c) => isDecorativeLayer(c as SceneNode))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * True when the subtree is illustration-only (vectors/shapes/nested groups).
+ * Grain, terrain, and mask artwork must not be packed into tidy row/col wrappers.
+ */
+export function isIllustrationSubtree(node: SceneNode): boolean {
+  if (
+    node.type === "TEXT" ||
+    node.type === "INSTANCE" ||
+    node.type === "COMPONENT" ||
+    node.type === "COMPONENT_SET"
+  ) {
+    return false;
+  }
+  if (isDecorativeLayer(node)) return true;
+  if ((node.type === "GROUP" || node.type === "FRAME") && "children" in node) {
+    const kids = node.children.filter(
+      (c) => c.visible !== false && c.type !== "SLICE",
+    );
+    return (
+      kids.length > 0 &&
+      kids.every((c) => isIllustrationSubtree(c as SceneNode))
+    );
+  }
+  return false;
+}
+
 export function parentHasFills(node: SceneNode): boolean {
   if (!("fills" in node)) return false;
   const fills = (node as MinimalFillsMixin).fills;
@@ -77,8 +139,8 @@ export function parentHasFills(node: SceneNode): boolean {
 }
 
 /**
- * Classify visible children into background / overlay / flow / absolute (rotated).
- * `index` order is paint order (lower = behind).
+ * Split visible children into flow vs absolute buckets. Paint order (`index`) matters
+ * for background detection; rotated nodes are always absolute because AL cannot represent them.
  */
 export function classifyChildren(
   items: ChildGeom[],
@@ -98,20 +160,61 @@ export function classifyChildren(
     candidates.push(item);
   }
 
-  // Background: near-full cover, prefer lowest index among covers
+  // Full-bleed layer behind content — lowest paint index wins among covers.
   const covers = candidates
     .filter((c) => coversParent(c.rect, parentRect, BG_COVER_RATIO))
     .sort((a, b) => a.index - b.index);
 
-  let bg: ChildGeom | null = covers[0] ?? null;
-  // Prefer plain fill shapes as foldable bg
+  // Plain fills can fold into the parent. A covering VECTOR with siblings
+  // nested inside it is a stacked icon (LINE mark), not a page background.
+  let bg: ChildGeom | null = null;
   const plainCover = covers.find((c) => isPlainFillShape(c.node));
-  if (plainCover) bg = plainCover;
+  if (plainCover) {
+    bg = plainCover;
+  } else if (covers[0]) {
+    const cover = covers[0];
+    const others = candidates.filter((c) => c !== cover);
+    const stackedIcon =
+      others.length > 0 &&
+      isDecorativeOrIconGroup(cover.node) &&
+      others.every((o) => isDecorativeOrIconGroup(o.node)) &&
+      siblingsSitInside(cover, others);
+    if (!stackedIcon) bg = cover;
+  }
 
   const rest = candidates.filter((c) => c !== bg);
   if (bg) backgrounds.push(bg);
 
-  // Pairwise overlaps → smaller on top is overlay (unless both large decorative)
+  // Marks/icons sitting on a folded background were never paired for overlay
+  // detection (bg left `rest`) — treat them as overlays so one-child VERTICAL
+  // Auto Layout does not stack them under the tile.
+  if (bg) {
+    for (const item of [...rest]) {
+      if (
+        rectArea(item.rect) < rectArea(bg.rect) * 0.4 &&
+        containsPoint(bg.rect, rectCenterX(item.rect), rectCenterY(item.rect))
+      ) {
+        overlays.push(item);
+        const idx = rest.indexOf(item);
+        if (idx >= 0) rest.splice(idx, 1);
+      }
+    }
+  }
+
+  // If bg was a stacked-icon base (decorative cover + icon-group siblings still
+  // in rest), put it back so the heavy-overlap path keeps the whole mark absolute.
+  if (
+    bg &&
+    isDecorativeOrIconGroup(bg.node) &&
+    rest.length > 0 &&
+    rest.every((o) => isDecorativeOrIconGroup(o.node)) &&
+    siblingsSitInside(bg, rest)
+  ) {
+    rest.unshift(bg);
+    backgrounds.pop();
+    bg = null;
+  }
+
   const flowSet = new Set(rest);
   const overlapPairs: Array<[ChildGeom, ChildGeom]> = [];
 
@@ -126,14 +229,23 @@ export function classifyChildren(
     }
   }
 
-  // Decorative: ≥3 siblings with pairwise overlaps and no clear size hierarchy
-  if (overlapPairs.length >= 3 && rest.length >= 3) {
+  // Overlapping siblings that are all decorative (badges, icons) cannot share one Auto Layout flow.
+  // Do NOT trigger on repeated independent pairs (e.g. 5 news tag pills) — that emptied list rows.
+  if (rest.length >= 2) {
     const heavilyOverlapped = new Set<ChildGeom>();
     for (const [a, b] of overlapPairs) {
       heavilyOverlapped.add(a);
       heavilyOverlapped.add(b);
     }
-    if (heavilyOverlapped.size >= 3) {
+    const allDecorative = [...heavilyOverlapped].every((i) =>
+      isDecorativeOrIconGroup(i.node),
+    );
+    if (
+      allDecorative &&
+      ((overlapPairs.length >= 3 && heavilyOverlapped.size >= 3) ||
+        (heavilyOverlapped.size === rest.length &&
+          overlapPairs.length >= rest.length - 1))
+    ) {
       for (const item of heavilyOverlapped) {
         if (flowSet.has(item)) {
           absolute.push(item);
@@ -147,8 +259,16 @@ export function classifyChildren(
     if (!flowSet.has(a) || !flowSet.has(b)) continue;
     const smaller = rectArea(a.rect) <= rectArea(b.rect) ? a : b;
     const larger = smaller === a ? b : a;
-    // Badge / icon on card: small overlaps larger and center inside larger
+    // Badge/icon on a card: small layer centered inside a larger sibling stays absolute overlay.
+    // Keep TEXT sitting on a pill/rect in flow so list rows can wrap tag+date+title together.
+    const textOnPill =
+      smaller.node.type === "TEXT" &&
+      (larger.node.type === "RECTANGLE" ||
+        larger.node.type === "ELLIPSE" ||
+        larger.node.type === "FRAME" ||
+        larger.node.type === "GROUP");
     if (
+      !textOnPill &&
       rectArea(smaller.rect) < rectArea(larger.rect) * 0.4 &&
       containsPoint(
         larger.rect,
@@ -160,8 +280,9 @@ export function classifyChildren(
       flowSet.delete(smaller);
       continue;
     }
-    // Significant overlap without clear containment → both absolute
-    if (overlapRatioOfMin(a.rect, b.rect) >= 0.5) {
+    // Heavy mutual overlap without containment — neither sibling belongs in Auto Layout flow.
+    // text-on-pill pairs stay in flow so canyon/row wrappers can group them.
+    if (!textOnPill && overlapRatioOfMin(a.rect, b.rect) >= 0.5) {
       if (flowSet.has(a)) {
         absolute.push(a);
         flowSet.delete(a);
@@ -173,7 +294,7 @@ export function classifyChildren(
     }
   }
 
-  // Small floating near edge overlapping others → overlay
+  // Small edge-adjacent floaters that overlap content are overlays, not flow items.
   for (const item of [...flowSet]) {
     const area = rectArea(item.rect);
     const parentArea = rectArea(parentRect);
@@ -201,7 +322,7 @@ export function classifyChildren(
     }
   }
 
-  // Overflow outside parent → absolute
+  // Layers extending well outside the parent bounds break Auto Layout — keep absolute.
   for (const item of [...flowSet]) {
     if (
       item.rect.x < -ALIGN_EPS ||
@@ -209,7 +330,7 @@ export function classifyChildren(
       item.rect.x + item.rect.width > parentRect.width + ALIGN_EPS ||
       item.rect.y + item.rect.height > parentRect.height + ALIGN_EPS
     ) {
-      // Only if substantially outside
+      // Require substantial overflow — minor sub-pixel bleed is tolerated.
       const outside =
         item.rect.x < -ALIGN_EPS * 2 ||
         item.rect.y < -ALIGN_EPS * 2 ||

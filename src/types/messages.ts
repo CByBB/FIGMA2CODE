@@ -1,3 +1,7 @@
+/**
+ * postMessage payload types between the Figma main thread and the UI iframe
+ * (conversion results, ZIP streaming, settings, OpenRouter key status).
+ */
 import { LinearGradientConversion, SolidColorConversion } from "./color";
 import { PluginSettings } from "./settings";
 
@@ -7,12 +11,12 @@ export interface HTMLPreview {
 }
 
 export interface ConversionData {
-  /** First lines of the generated document (full HTML stays in main) */
+  /** Head preview only; full HTML stays on the main thread until copy/display */
   codePreview: string;
   lineCount: number;
   codeBytes: number;
   settings: PluginSettings;
-  /** @deprecated Preview removed — kept optional for message compat */
+  /** Legacy iframe preview payload; optional for backward-compatible messages */
   htmlPreview?: HTMLPreview;
   colors: SolidColorConversion[];
   gradients: LinearGradientConversion[];
@@ -75,6 +79,17 @@ export type ZipErrorMessage = Message & {
 };
 export type ExportZipMessage = Message & { type: "exportZip" };
 export type TidyAndConvertMessage = Message & { type: "tidyAndConvert" };
+export type SetOpenRouterKeyMessage = Message & {
+  type: "setOpenRouterKey";
+  key: string;
+};
+export type GetOpenRouterKeyStatusMessage = Message & {
+  type: "getOpenRouterKeyStatus";
+};
+export type OpenRouterKeyStatusMessage = Message & {
+  type: "openRouterKeyStatus";
+  hasKey: boolean;
+};
 export type RequestFullCodeMessage = Message & {
   type: "requestFullCode";
   purpose: "copy" | "display";
@@ -83,4 +98,21 @@ export type FullCodeMessage = Message & {
   type: "fullCode";
   code: string;
   purpose: "copy" | "display";
+};
+export type GetSelectionJsonMessage = Message & {
+  type: "get-selection-json";
+  purpose?: "copy" | "display";
+  /** panel: REST JSON for the preview pane; omit for About debug copy */
+  source?: "panel";
+  /** panel display: send the full JSON string instead of the 25-line preview */
+  full?: boolean;
+};
+export type SelectionJsonMessage = Message & {
+  type: "selection-json";
+  data?: unknown;
+  purpose?: "copy" | "display";
+  jsonPreview?: string;
+  jsonText?: string;
+  jsonLineCount?: number;
+  showingFull?: boolean;
 };

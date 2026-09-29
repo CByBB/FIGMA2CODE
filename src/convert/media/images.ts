@@ -3,13 +3,13 @@ import { btoa } from "js-base64";
 import { addWarning } from "../warnings";
 import { exportAsyncProxy } from "./exportAsync";
 import { bytesToDataUrl, getCachedAsset } from "../../export/cache";
+import { logError, safeNodeRef } from "../../shared/log";
 
+// Image fills: ZIP cache → base64 data URL, or live exportAsync fallback for preview.
 export const PLACEHOLDER_IMAGE_DOMAIN = "https://placehold.co";
 
 const createCanvasImageUrl = (width: number, height: number): string => {
-  // Check if we're in a browser environment
   if (typeof document === "undefined" || typeof window === "undefined") {
-    // Fallback for non-browser environments
     return `${PLACEHOLDER_IMAGE_DOMAIN}/${width}x${height}`;
   }
 
@@ -19,7 +19,6 @@ const createCanvasImageUrl = (width: number, height: number): string => {
 
   const ctx = canvas.getContext("2d");
   if (!ctx) {
-    // Fallback if canvas context is not available
     return `${PLACEHOLDER_IMAGE_DOMAIN}/${width}x${height}`;
   }
 
@@ -60,7 +59,7 @@ const fillIsImage = ({ type }: Paint) => type === "IMAGE";
 export const getImageFills = (node: MinimalFillsMixin): ImagePaint[] => {
   try {
     return (node.fills as ImagePaint[]).filter(fillIsImage);
-  } catch (e) {
+  } catch {
     return [];
   }
 };
@@ -72,12 +71,10 @@ export const nodeHasMultipleFills = (node: MinimalFillsMixin) =>
   node.fills instanceof Array && node.fills.length > 1;
 
 const imageBytesToBase64 = (bytes: Uint8Array): string => {
-  // Convert Uint8Array to binary string
   const binaryString = bytes.reduce((data, byte) => {
     return data + String.fromCharCode(byte);
   }, "");
 
-  // Encode binary string to base64
   const b64 = btoa(binaryString);
 
   return `data:image/png;base64,${b64}`;
@@ -88,13 +85,12 @@ export const exportNodeAsBase64PNG = async <T extends ExportableNode>(
   excludeChildren: boolean,
   options?: { relativeAssetPaths?: boolean },
 ) => {
-  // Prefer bytes from ZIP asset export (framed PNG / accurate bake)
+  // Prefer framed PNG bytes from ZIP export when available.
   const cached = node.id ? getCachedAsset(node.id) : undefined;
   if (cached && cached.format !== "SVG") {
     if (options?.relativeAssetPaths && cached.path) {
       return cached.path;
     }
-    // Shortcut export if the node has already been converted.
     if (node.base64 !== undefined && node.base64 !== "") {
       return node.base64;
     }
@@ -104,7 +100,6 @@ export const exportNodeAsBase64PNG = async <T extends ExportableNode>(
     }
   }
 
-  // Shortcut export if the node has already been converted.
   if (node.base64 !== undefined && node.base64 !== "") {
     return node.base64;
   }
@@ -143,8 +138,8 @@ export const exportNodeAsBase64PNG = async <T extends ExportableNode>(
     node.base64 = base64;
     return base64;
   } catch (error) {
-    addWarning(`Failed exporting image for ${node.name || node.id}`);
-    console.error(`Error exporting PNG for ${node.type}:${node.id}`, error);
+    logError(`Failed exporting image (${safeNodeRef(node)})`, error);
+    addWarning(`Failed exporting image for ${safeNodeRef(node)}`);
     return getPlaceholderImage(node.width, node.height);
   } finally {
     restoreChildren();

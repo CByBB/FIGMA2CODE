@@ -1,14 +1,19 @@
+/** Walks the clone tree and builds a TidyPlan (Auto Layout specs, wrappers, group conversions). */
+
 import {
   ALIGN_EPS,
   ChildGeom,
   GAP_EPS,
+  OVERLAP_AREA_RATIO,
   Rect,
   bandSplit,
   childGeom,
   consecutiveGaps,
   isCleanStack,
+  majorGapClusters,
   median,
   nearlyEqual,
+  overlapRatioOfMin,
   parentAbsRect,
   parentLocalRect,
   rectBottom,
@@ -23,6 +28,8 @@ import {
   canHaveChildren,
   classifyChildren,
   isAutoLayoutFrame,
+  isDecorativeLayer,
+  isIllustrationSubtree,
   isLeafType,
   isPlainFillShape,
   parentHasFills,
@@ -84,7 +91,7 @@ function childSizingFor(
   contentBox: Rect,
   _axis: "HORIZONTAL" | "VERTICAL" | null,
 ): ChildSizingSpec {
-  // Pixel fidelity: always FIXED. FILL/HUG often reflows and shifts the design.
+  // Convert always needs FIXED boxes — HUG/FILL reflows and shifts pixels away from the design.
   void contentBox;
   return {
     nodeId: item.node.id,
@@ -111,7 +118,7 @@ function inferCounterAlign(
 
   for (const item of items) {
     if (axis === "HORIZONTAL") {
-      // counter = Y
+      // Counter-axis is Y when the primary flow is horizontal.
       starts.push(item.rect.y);
       centers.push(rectCenterY(item.rect));
       ends.push(rectBottom(item.rect));
@@ -137,7 +144,7 @@ function inferCounterAlign(
   const endSame = ends.every((e) => nearlyEqual(e, ends[0]));
   const centerSame = centers.every((c) => nearlyEqual(c, centers[0]));
 
-  // Baseline for text-only rows
+  // Text+icon rows may align on baseline instead of box edges.
   if (
     axis === "HORIZONTAL" &&
     items.every(
@@ -168,7 +175,7 @@ function inferCounterAlign(
   if (endSame && !startSame) return { parent: "MAX", perChild };
   if (centerSame) return { parent: "CENTER", perChild };
 
-  // Mixed → per-child
+  // Per-child alignment when siblings disagree — constraints and position hints break ties.
   for (const item of items) {
     const hints = constraintHints(item.node);
     if (axis === "HORIZONTAL") {
@@ -275,7 +282,7 @@ function inferPrimaryMetrics(
       padB = axis === "VERTICAL" ? 0 : padB;
     } else if (sd <= GAP_EPS) {
       itemSpacing = roundPx(Math.max(0, med));
-      // Centered cluster?
+      // Content cluster centered in the parent with equal leading/trailing inset.
       const contentStart = axis === "HORIZONTAL" ? first.rect.x : first.rect.y;
       const contentEnd =
         axis === "HORIZONTAL" ? rectRight(last.rect) : rectBottom(last.rect);
@@ -299,7 +306,7 @@ function inferPrimaryMetrics(
         }
       }
     } else {
-      // Two-scale gaps: use median of the smaller cluster
+      // Mixed gap scales (e.g. section spacing vs item spacing) — use the tighter cluster gap.
       const sortedGaps = [...positiveGaps]
         .map((g) => Math.max(0, g))
         .sort((a, b) => a - b);
@@ -311,7 +318,7 @@ function inferPrimaryMetrics(
     }
   }
 
-  // Negative gaps already filtered to absolute in classify; remaining slight overlap → 0
+  // Residual overlap in an otherwise clean stack → treat spacing as zero.
   if (gaps.some((g) => g < -ALIGN_EPS)) {
     itemSpacing = 0;
   }
@@ -368,7 +375,7 @@ function buildWrapper(
     width: 0,
     height: 0,
   };
-  // Local metrics relative to wrapper bounds
+  // Metrics are relative to the wrapper's union bounds, not the parent frame.
   const localItems: ChildGeom[] = items.map((i) => ({
     ...i,
     rect: {
@@ -407,6 +414,202 @@ function buildWrapper(
   };
 }
 
+function pseudoFromBounds(seed: ChildGeom, bounds: Rect): ChildGeom {
+  return {
+    node: seed.node,
+    index: seed.index,
+    rect: bounds,
+    layoutW: bounds.width,
+    layoutH: bounds.height,
+    layoutX: bounds.x,
+    layoutY: bounds.y,
+  };
+}
+
+/**
+ * Wrapper that may contain nested row/col wrappers when the cluster is not a
+ * clean single-axis stack (e.g. a list column of horizontal news rows).
+ */
+function buildDeepWrapper(
+  items: ChildGeom[],
+  axis: "HORIZONTAL" | "VERTICAL",
+  _parentContent: Rect,
+  depth = 0,
+): WrapperSpec {
+  if (items.length < 2 || depth > 2) {
+    return buildWrapper(items, axis, _parentContent);
+  }
+  if (isCleanStack(items, axis)) {
+    return buildWrapper(items, axis, _parentContent);
+  }
+
+  // Inside a vertical column, pack horizontal row bands (and vice versa).
+  const bandAxis = axis;
+  const innerAxis: "HORIZONTAL" | "VERTICAL" =
+    axis === "VERTICAL" ? "HORIZONTAL" : "VERTICAL";
+  const bands = bandSplit(items, bandAxis);
+  if (bands.length >= 2 && bands.some((b) => b.length >= 2)) {
+    return buildWrapperWithNestedBands(
+      items,
+      bands,
+      axis,
+      innerAxis,
+      depth + 1,
+    );
+  }
+
+  // One more canyon split inside the cluster (e.g. sub-columns).
+  const gapAxis = axis === "VERTICAL" ? "HORIZONTAL" : "VERTICAL";
+  const sub = majorGapClusters(items, gapAxis);
+  if (sub && sub.length >= 2) {
+    const subInner: "HORIZONTAL" | "VERTICAL" =
+      gapAxis === "HORIZONTAL" ? "VERTICAL" : "HORIZONTAL";
+    return buildWrapperWithNestedBands(
+      items,
+      sub,
+      gapAxis,
+      subInner,
+      depth + 1,
+    );
+  }
+
+  return buildWrapper(items, axis, _parentContent);
+}
+
+function buildWrapperWithNestedBands(
+  items: ChildGeom[],
+  bands: ChildGeom[][],
+  outerAxis: "HORIZONTAL" | "VERTICAL",
+  innerAxis: "HORIZONTAL" | "VERTICAL",
+  depth: number,
+): WrapperSpec {
+  const bounds = unionRect(items.map((i) => i.rect)) ?? {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+  };
+
+  const nested: WrapperSpec[] = [];
+  const direct: ChildGeom[] = [];
+  const pseudo: ChildGeom[] = [];
+
+  for (const band of bands) {
+    if (band.length >= 2) {
+      const inner = buildDeepWrapper(band, innerAxis, bounds, depth);
+      nested.push({
+        ...inner,
+        bounds: {
+          x: inner.bounds.x - bounds.x,
+          y: inner.bounds.y - bounds.y,
+          width: inner.bounds.width,
+          height: inner.bounds.height,
+        },
+      });
+      pseudo.push(pseudoFromBounds(band[0], inner.bounds));
+    } else {
+      direct.push(band[0]);
+      pseudo.push(band[0]);
+    }
+  }
+
+  const localPseudo: ChildGeom[] = pseudo.map((p) => ({
+    ...p,
+    rect: {
+      x: p.rect.x - bounds.x,
+      y: p.rect.y - bounds.y,
+      width: p.rect.width,
+      height: p.rect.height,
+    },
+  }));
+  const localParent: Rect = {
+    x: 0,
+    y: 0,
+    width: bounds.width,
+    height: bounds.height,
+  };
+  const metrics = inferPrimaryMetrics(localPseudo, localParent, outerAxis);
+  const { parent: counter, perChild } = inferCounterAlign(
+    localPseudo,
+    metrics.contentBox,
+    outerAxis,
+  );
+  const childSizing = direct.map((item) => {
+    const local = {
+      ...item,
+      rect: {
+        x: item.rect.x - bounds.x,
+        y: item.rect.y - bounds.y,
+        width: item.rect.width,
+        height: item.rect.height,
+      },
+    };
+    const s = childSizingFor(local, metrics.contentBox, outerAxis);
+    const align = perChild.get(item.node.id);
+    if (align) s.layoutAlign = align;
+    return s;
+  });
+
+  return {
+    key: nextWrapperKey(),
+    name: wrapperName(items, outerAxis === "HORIZONTAL" ? "row" : "col"),
+    childNodeIds: direct.map((i) => i.node.id),
+    layout: makeLayout(outerAxis, metrics, counter),
+    childSizing,
+    bounds,
+    wrappers: nested.length > 0 ? nested : undefined,
+  };
+}
+
+function structureFromGapClusters(
+  clusters: ChildGeom[][],
+  /** Parent flows along this axis (HORIZONTAL = columns side by side). */
+  parentAxis: "HORIZONTAL" | "VERTICAL",
+  parentRect: Rect,
+): {
+  layout: AutoLayoutSpec | null;
+  wrappers: WrapperSpec[];
+  childSizing: ChildSizingSpec[];
+  fallbackAbsolute: ChildGeom[];
+} {
+  const childAxis: "HORIZONTAL" | "VERTICAL" =
+    parentAxis === "HORIZONTAL" ? "VERTICAL" : "HORIZONTAL";
+  const wrappers: WrapperSpec[] = [];
+  const direct: ChildGeom[] = [];
+  const pseudo: ChildGeom[] = [];
+
+  for (const cluster of clusters) {
+    if (cluster.length === 1) {
+      direct.push(cluster[0]);
+      pseudo.push(cluster[0]);
+      continue;
+    }
+    const w = buildDeepWrapper(cluster, childAxis, parentRect);
+    wrappers.push(w);
+    pseudo.push(pseudoFromBounds(cluster[0], w.bounds));
+  }
+
+  const metrics = inferPrimaryMetrics(pseudo, parentRect, parentAxis);
+  const { parent: counter, perChild } = inferCounterAlign(
+    direct.length === pseudo.length ? direct : pseudo,
+    metrics.contentBox,
+    parentAxis,
+  );
+  const childSizing = direct.map((item) => {
+    const s = childSizingFor(item, metrics.contentBox, parentAxis);
+    const align = perChild.get(item.node.id);
+    if (align) s.layoutAlign = align;
+    return s;
+  });
+
+  return {
+    layout: makeLayout(parentAxis, metrics, counter),
+    wrappers,
+    childSizing,
+    fallbackAbsolute: [],
+  };
+}
+
 function inferStructure(
   flow: ChildGeom[],
   parentRect: Rect,
@@ -427,12 +630,23 @@ function inferStructure(
 
   if (flow.length === 1) {
     const item = flow[0];
+    // A single decorative/icon child is almost always an absolute mark, not a
+    // one-item Auto Layout column (that was stacking icon marks under tiles).
+    if (
+      isDecorativeLayer(item.node) ||
+      item.node.type === "GROUP" ||
+      item.node.type === "TEXT" ||
+      item.node.type === "INSTANCE"
+    ) {
+      return {
+        layout: null,
+        wrappers: [],
+        childSizing: [],
+        fallbackAbsolute: [item],
+      };
+    }
     const metrics = inferPrimaryMetrics(flow, parentRect, "VERTICAL");
     const sizing = childSizingFor(item, metrics.contentBox, "VERTICAL");
-    const hints = constraintHints(item.node);
-    if (hints.preferCenterH || hints.preferCenterV) {
-      // keep
-    }
     return {
       layout: makeLayout("VERTICAL", metrics, "MIN"),
       wrappers: [],
@@ -441,7 +655,7 @@ function inferStructure(
     };
   }
 
-  // Prefer clean single-axis stacks
+  // Single-axis stacks map directly to one Auto Layout frame.
   if (isCleanStack(flow, "VERTICAL")) {
     const metrics = inferPrimaryMetrics(flow, parentRect, "VERTICAL");
     const { parent: counter, perChild } = inferCounterAlign(
@@ -484,7 +698,18 @@ function inferStructure(
     };
   }
 
-  // Column of rows
+  // Major canyon split (section chrome | list, etc.) before fine Y-overlap bands —
+  // overlap banding mixes left columns into list rows and then pixel-rollback undoes all tidy.
+  const colClusters = majorGapClusters(flow, "HORIZONTAL");
+  if (colClusters) {
+    return structureFromGapClusters(colClusters, "HORIZONTAL", parentRect);
+  }
+  const rowClusters = majorGapClusters(flow, "VERTICAL");
+  if (rowClusters) {
+    return structureFromGapClusters(rowClusters, "VERTICAL", parentRect);
+  }
+
+  // Row bands inside a vertical stack → horizontal wrapper frames per band.
   const rowBands = bandSplit(flow, "VERTICAL");
   if (rowBands.length >= 2 && rowBands.some((b) => b.length >= 2)) {
     const wrappers: WrapperSpec[] = [];
@@ -493,17 +718,9 @@ function inferStructure(
 
     for (const band of rowBands) {
       if (band.length >= 2) {
-        const w = buildWrapper(band, "HORIZONTAL", parentRect);
+        const w = buildDeepWrapper(band, "HORIZONTAL", parentRect);
         wrappers.push(w);
-        pseudoForParent.push({
-          node: band[0].node,
-          index: band[0].index,
-          rect: w.bounds,
-          layoutW: w.bounds.width,
-          layoutH: w.bounds.height,
-          layoutX: w.bounds.x,
-          layoutY: w.bounds.y,
-        });
+        pseudoForParent.push(pseudoFromBounds(band[0], w.bounds));
       } else {
         direct.push(band[0]);
         pseudoForParent.push(band[0]);
@@ -536,7 +753,7 @@ function inferStructure(
     }
   }
 
-  // Row of columns
+  // Column bands inside a horizontal stack → vertical wrapper frames per band.
   const colBands = bandSplit(flow, "HORIZONTAL");
   if (colBands.length >= 2 && colBands.some((b) => b.length >= 2)) {
     const wrappers: WrapperSpec[] = [];
@@ -545,17 +762,9 @@ function inferStructure(
 
     for (const band of colBands) {
       if (band.length >= 2) {
-        const w = buildWrapper(band, "VERTICAL", parentRect);
+        const w = buildDeepWrapper(band, "VERTICAL", parentRect);
         wrappers.push(w);
-        pseudoForParent.push({
-          node: band[0].node,
-          index: band[0].index,
-          rect: w.bounds,
-          layoutW: w.bounds.width,
-          layoutH: w.bounds.height,
-          layoutX: w.bounds.x,
-          layoutY: w.bounds.y,
-        });
+        pseudoForParent.push(pseudoFromBounds(band[0], w.bounds));
       } else {
         direct.push(band[0]);
         pseudoForParent.push(band[0]);
@@ -586,7 +795,7 @@ function inferStructure(
     };
   }
 
-  // Grid / wrap
+  // Uniform-height grid or ragged wrap as a last resort before falling back to absolute.
   const grid = tryInferGridOrWrap(flow, parentRect);
   if (grid) return { ...grid, fallbackAbsolute: [] };
 
@@ -696,9 +905,82 @@ function inferFrame(
   for (const item of [...classified.overlays, ...classified.absolute]) {
     absoluteChildren.push({
       nodeId: item.node.id,
-      x: item.layoutX,
-      y: item.layoutY,
+      x: item.rect.x,
+      y: item.rect.y,
     });
+  }
+
+  let flow = classified.flow;
+  const extras = [
+    ...classified.backgrounds,
+    ...classified.overlays,
+    ...classified.absolute,
+  ];
+  // Leftover flow that still overlaps extracted layers is stacked artwork (e.g. LINE icon).
+  if (
+    flow.length > 0 &&
+    extras.length > 0 &&
+    [...flow, ...extras].every((i) => isDecorativeLayer(i.node)) &&
+    flow.every((f) =>
+      extras.some(
+        (e) => overlapRatioOfMin(f.rect, e.rect) >= OVERLAP_AREA_RATIO,
+      ),
+    )
+  ) {
+    for (const item of flow) {
+      absoluteChildren.push({
+        nodeId: item.node.id,
+        x: item.rect.x,
+        y: item.rect.y,
+      });
+    }
+    tidyWarn(
+      `Stacked overlapping layers in "${node.name}" kept absolute (not a flow)`,
+    );
+    flow = [];
+  }
+
+  // Scattered vectors (grain, terrain, splatters) look like Y-aligned "rows" to
+  // bandSplit. Wrapping them adds containing blocks; JSON_REST_V1 then reports
+  // child AABBs in the old ancestor space → HTML double-offsets the artwork.
+  if (flow.length >= 2 && flow.every((i) => isIllustrationSubtree(i.node))) {
+    for (const item of flow) {
+      absoluteChildren.push({
+        nodeId: item.node.id,
+        x: item.rect.x,
+        y: item.rect.y,
+      });
+    }
+    tidyWarn(
+      `Illustration layers in "${node.name}" kept absolute (not a flow)`,
+    );
+    flow = [];
+  }
+
+  // Even when mixed with text/nav, illustration groups (sun, samurai mask, rocks)
+  // must stay absolute. Leaving them in flow lets Auto Layout pack them at (0,0)
+  // — Hero Mask at (584,569) became (0,0) and HTML drew the silhouette top-left.
+  if (flow.length > 0) {
+    const kept: ChildGeom[] = [];
+    let pulled = 0;
+    for (const item of flow) {
+      if (isIllustrationSubtree(item.node)) {
+        absoluteChildren.push({
+          nodeId: item.node.id,
+          x: item.rect.x,
+          y: item.rect.y,
+        });
+        pulled += 1;
+      } else {
+        kept.push(item);
+      }
+    }
+    if (pulled > 0) {
+      flow = kept;
+      tidyWarn(
+        `${pulled} illustration layer(s) in "${node.name}" pinned absolute (mixed with UI flow)`,
+      );
+    }
   }
 
   let foldBackgroundId: string | undefined;
@@ -711,8 +993,8 @@ function inferFrame(
       stretchBackgroundId = bg.node.id;
       absoluteChildren.push({
         nodeId: bg.node.id,
-        x: bg.layoutX,
-        y: bg.layoutY,
+        x: bg.rect.x,
+        y: bg.rect.y,
       });
       tidyWarn(`Background "${bg.node.name}" kept as absolute stretch`);
     }
@@ -724,12 +1006,12 @@ function inferFrame(
     );
   }
 
-  const structure = inferStructure(classified.flow, parentRect);
+  const structure = inferStructure(flow, parentRect);
   for (const item of structure.fallbackAbsolute) {
     absoluteChildren.push({
       nodeId: item.node.id,
-      x: item.layoutX,
-      y: item.layoutY,
+      x: item.rect.x,
+      y: item.rect.y,
     });
   }
 
@@ -761,7 +1043,7 @@ function walkForPlan(node: SceneNode, plan: TidyPlan): void {
       return;
     }
     plan.groupsToFrame.push(group.id);
-    // Infer as if this group were already a freeform frame (id remapped in apply).
+    // Group nodes become frames in apply — infer layout here using remapped ids later.
     if (group.children.length > 0) {
       plan.frames.push(
         inferFrame(
@@ -793,6 +1075,7 @@ function walkForPlan(node: SceneNode, plan: TidyPlan): void {
     const frame = node as FrameNode | ComponentNode | ComponentSetNode;
 
     if (isAutoLayoutFrame(frame)) {
+      // Existing Auto Layout is left intact at this frame; only freeform descendants are inferred.
       tidyWarn(
         `Skipped Auto Layout frame "${frame.name}" (descendants may still tidy)`,
       );
@@ -813,7 +1096,7 @@ function walkForPlan(node: SceneNode, plan: TidyPlan): void {
       return;
     }
 
-    // Freeform frame
+    // Freeform frame — candidate for Auto Layout inference.
     if (frame.children.length === 0) return;
 
     const spec = inferFrame(
@@ -844,7 +1127,7 @@ export function buildTidyPlan(root: SceneNode): TidyPlan {
     warnings: [],
   };
   walkForPlan(root, plan);
-  // groupsToFrame: process deepest first (reverse of discovery if DFS pre-order → reverse)
+  // Deepest groups convert first so parent ids remain valid during apply.
   plan.groupsToFrame.reverse();
   plan.groupsToUnwrap.reverse();
   return plan;

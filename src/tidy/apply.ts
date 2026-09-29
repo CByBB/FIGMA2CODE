@@ -1,3 +1,5 @@
+/** Applies an inferred TidyPlan to the live clone with pixel-drift rollback. */
+
 import type {
   AutoLayoutSpec,
   FrameTidySpec,
@@ -7,19 +9,30 @@ import type {
 import {
   AbsSnap,
   TIDY_WRAPPER_KEY,
+  convertGroupToFrame,
   driftedIds,
+  paintKey,
+  placeLocalBox,
   restoreFramePixelPerfect,
+  revertParentAutoLayoutKeepWrappers,
   snapAbs,
   snapTree,
 } from "./preserve";
+import { isRotatable } from "./classify";
 import { tidyWarn } from "./warnings";
+import { logError, safeNodeRef, isMissingNodeError } from "../shared/log";
 
 async function getNode(id: string): Promise<BaseNode | null> {
-  return figma.getNodeByIdAsync(id);
+  try {
+    return await figma.getNodeByIdAsync(id);
+  } catch (e) {
+    logError(`getNodeByIdAsync failed for ${id}`, e);
+    return null;
+  }
 }
 
 function applyAutoLayout(frame: BaseFrameMixin, layout: AutoLayoutSpec): void {
-  // Pixel-stable defaults: never hug the parent; keep exact outer size.
+  // FIXED outer size prevents Auto Layout from resizing the frame away from the snapshot.
   frame.layoutMode = layout.layoutMode;
   frame.primaryAxisSizingMode = "FIXED";
   frame.counterAxisSizingMode = "FIXED";
@@ -28,7 +41,7 @@ function applyAutoLayout(frame: BaseFrameMixin, layout: AutoLayoutSpec): void {
   frame.paddingTop = layout.paddingTop;
   frame.paddingBottom = layout.paddingBottom;
   frame.itemSpacing = layout.itemSpacing;
-  // Prefer MIN — CENTER / SPACE_BETWEEN / BASELINE often shift pixels.
+  // Conservative alignment: only use inferred values when they were explicitly chosen.
   frame.primaryAxisAlignItems =
     layout.primaryAxisAlignItems === "SPACE_BETWEEN"
       ? "SPACE_BETWEEN"
@@ -56,7 +69,7 @@ function applyAutoLayout(frame: BaseFrameMixin, layout: AutoLayoutSpec): void {
   }
 }
 
-/** Always FIXED sizes so Auto Layout cannot resize children. */
+/** Pin child to FIXED sizing so convert sees the same pixel box as before tidy. */
 function pinFixedSize(node: SceneNode, w: number, h: number): void {
   if (!("layoutSizingHorizontal" in node)) return;
   const n = node as SceneNode & {
@@ -69,13 +82,35 @@ function pinFixedSize(node: SceneNode, w: number, h: number): void {
     n.layoutSizingHorizontal = "FIXED";
     n.layoutSizingVertical = "FIXED";
     n.layoutGrow = 0;
-    n.layoutAlign = "MIN";
-    if ("resize" in n) {
-      (n as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
+    n.layoutAlign = "INHERIT";
+    // AABB size ≠ layout size when rotated — resizing to the box grows the node.
+    // Zero-width/height lines must not be forced to 1px (that alone fails pixel checks).
+    // TEXT resize needs fonts loaded; skip no-op resizes to avoid glyph churn.
+    if (
+      "resize" in n &&
+      !isRotatable(n) &&
+      node.type !== "LINE" &&
+      w >= 0.5 &&
+      h >= 0.5
+    ) {
+      const curW = "width" in node ? Math.abs(node.width) : w;
+      const curH = "height" in node ? Math.abs(node.height) : h;
+      if (Math.abs(curW - w) > 0.5 || Math.abs(curH - h) > 0.5) {
+        (n as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
+      }
     }
   } catch (e) {
-    console.warn("[tidy] pinFixedSize failed", node.name, e);
+    logError(`layout sizing write failed (${safeNodeRef(n)})`, e);
   }
+}
+
+function parentAllowsAbsolute(node: SceneNode): boolean {
+  const parent = node.parent;
+  return Boolean(
+    parent &&
+    "layoutMode" in parent &&
+    (parent as BaseFrameMixin).layoutMode !== "NONE",
+  );
 }
 
 function applyAbsoluteAt(
@@ -86,19 +121,13 @@ function applyAbsoluteAt(
   h?: number,
 ): void {
   try {
-    if ("layoutPositioning" in node) {
+    if (parentAllowsAbsolute(node) && "layoutPositioning" in node) {
       (node as FrameNode).layoutPositioning = "ABSOLUTE";
     }
-    if ("x" in node) {
-      (node as LayoutMixin).x = x;
-      (node as LayoutMixin).y = y;
-    }
-    if (typeof w === "number" && typeof h === "number" && "resize" in node) {
-      (node as LayoutMixin).resize(Math.max(1, w), Math.max(1, h));
-    }
   } catch (e) {
-    console.warn("[tidy] applyAbsoluteAt failed", node.name, e);
+    logError(`layoutPositioning ABSOLUTE failed (${safeNodeRef(node)})`, e);
   }
+  placeLocalBox(node, x, y, w, h);
 }
 
 function safeRemove(node: BaseNode): void {
@@ -106,55 +135,19 @@ function safeRemove(node: BaseNode): void {
     if (!node.parent) return;
     node.remove();
   } catch (e) {
-    console.warn("[tidy] safeRemove skipped (node already gone)", e);
+    if (isMissingNodeError(e)) return;
+    logError(`node remove failed (${safeNodeRef(node)})`, e);
   }
 }
 
-function convertGroupToFrame(group: GroupNode): FrameNode {
-  const parent = group.parent;
-  if (!parent || !("appendChild" in parent)) {
-    throw new Error(`Group "${group.name}" has no parent`);
+function parentAbsOrigin(node: BaseNode | null): { x: number; y: number } {
+  if (node && "absoluteBoundingBox" in node && node.absoluteBoundingBox) {
+    return {
+      x: node.absoluteBoundingBox.x,
+      y: node.absoluteBoundingBox.y,
+    };
   }
-
-  const index = parent.children.indexOf(group);
-  const children = [...group.children].map((child) => ({
-    node: child,
-    x: child.x,
-    y: child.y,
-  }));
-
-  const frame = figma.createFrame();
-  frame.name = group.name;
-  frame.resizeWithoutConstraints(
-    Math.max(1, group.width),
-    Math.max(1, group.height),
-  );
-  frame.x = group.x;
-  frame.y = group.y;
-  frame.fills = [];
-  frame.clipsContent = false;
-
-  if ("opacity" in group) frame.opacity = group.opacity;
-  if ("blendMode" in group) frame.blendMode = group.blendMode;
-  if ("isMask" in group) frame.isMask = group.isMask;
-  if ("locked" in group) frame.locked = group.locked;
-  if ("visible" in group) frame.visible = group.visible;
-
-  parent.insertChild(index >= 0 ? index : parent.children.length, frame);
-
-  for (const { node, x, y } of children) {
-    if (!node.parent) continue;
-    try {
-      frame.appendChild(node);
-      node.x = x;
-      node.y = y;
-    } catch (e) {
-      console.warn("[tidy] convertGroupToFrame child move failed", node.id, e);
-    }
-  }
-
-  safeRemove(group);
-  return frame;
+  return { x: 0, y: 0 };
 }
 
 function unwrapGroup(group: GroupNode): SceneNode {
@@ -163,12 +156,13 @@ function unwrapGroup(group: GroupNode): SceneNode {
     return group;
   }
   const child = group.children[0];
-  const gx = group.x;
-  const gy = group.y;
+  const snap = snapAbs(child);
   const index = parent.children.indexOf(group);
   parent.insertChild(index >= 0 ? index : parent.children.length, child);
-  child.x = gx + child.x;
-  child.y = gy + child.y;
+  if (snap && "x" in child) {
+    const dest = parentAbsOrigin(parent);
+    placeLocalBox(child, snap.x - dest.x, snap.y - dest.y);
+  }
   safeRemove(group);
   return child;
 }
@@ -192,11 +186,8 @@ async function createWrapperFrame(
 
   const moved: Array<{
     node: SceneNode;
-    lx: number;
-    ly: number;
+    snap: AbsSnap | null;
     index: number;
-    w: number;
-    h: number;
   }> = [];
   for (const id of spec.childNodeIds) {
     const n = await getNode(id);
@@ -204,14 +195,10 @@ async function createWrapperFrame(
     const child = n as SceneNode;
     if (!("x" in child)) continue;
     const index = parent.children.indexOf(child);
-    const snap = before.get(child.id);
     moved.push({
       node: child,
-      lx: (child as LayoutMixin).x - spec.bounds.x,
-      ly: (child as LayoutMixin).y - spec.bounds.y,
+      snap: before.get(child.id) ?? snapAbs(child),
       index: index >= 0 ? index : parent.children.length,
-      w: snap?.w ?? (child as LayoutMixin).width,
-      h: snap?.h ?? (child as LayoutMixin).height,
     });
   }
 
@@ -222,16 +209,32 @@ async function createWrapperFrame(
 
   parent.insertChild(insertAt, frame);
 
-  for (const { node, lx, ly, w, h } of moved) {
-    frame.appendChild(node);
-    if ("x" in node) {
-      (node as LayoutMixin).x = lx;
-      (node as LayoutMixin).y = ly;
+  // Append in original paint order so backgrounds stay under text (not LTR sort).
+  moved.sort((a, b) => paintKey(a.node) - paintKey(b.node));
+
+  const placeMoved = () => {
+    const fa = frame.absoluteBoundingBox;
+    for (const { node, snap } of moved) {
+      if (!snap || !fa) continue;
+      placeLocalBox(node, snap.x - fa.x, snap.y - fa.y, snap.w, snap.h);
+      pinFixedSize(node, snap.w, snap.h);
     }
-    pinFixedSize(node, w, h);
+  };
+
+  for (const { node } of moved) {
+    frame.appendChild(node);
+  }
+  placeMoved();
+
+  // Nested wrappers (row/col inside a canyon column) — bounds are local to `frame`.
+  for (const nested of spec.wrappers ?? []) {
+    await createWrapperFrame(frame, nested, before);
   }
 
-  // Defer Auto Layout on wrapper until sizes are pinned — still FIXED children.
+  // Positions after grouping, before this wrapper's Auto Layout.
+  const midWrap = snapTree(frame);
+
+  // Try Auto Layout; if it shifts pixels, keep the group frame with freeform children.
   applyAutoLayout(frame, {
     ...spec.layout,
     primaryAxisAlignItems: "MIN",
@@ -243,35 +246,33 @@ async function createWrapperFrame(
     Math.max(1, spec.bounds.width),
     Math.max(1, spec.bounds.height),
   );
+  for (const { node, snap } of moved) {
+    if (snap) pinFixedSize(node, snap.w, snap.h);
+  }
 
-  for (const { node, w, h } of moved) {
-    pinFixedSize(node, w, h);
+  const bad = driftedIds(frame, before);
+  if (bad.length > 0) {
+    try {
+      frame.layoutMode = "NONE";
+    } catch (e) {
+      logError(`wrapper layoutMode NONE failed (${safeNodeRef(frame)})`, e);
+    }
+    frame.resizeWithoutConstraints(
+      Math.max(1, spec.bounds.width),
+      Math.max(1, spec.bounds.height),
+    );
+    frame.x = spec.bounds.x;
+    frame.y = spec.bounds.y;
+    const fa = frame.absoluteBoundingBox;
+    for (const child of [...frame.children] as SceneNode[]) {
+      const s = midWrap.get(child.id);
+      if (s && fa) {
+        placeLocalBox(child, s.x - fa.x, s.y - fa.y, s.w, s.h);
+      }
+    }
   }
 
   return frame;
-}
-
-/**
- * Keep background as absolute at its original box — never fold fills
- * (folding drops strokes / radius quirks and shifts paint).
- */
-async function pinBackgroundAbsolute(
-  bgId: string,
-  before: Map<string, AbsSnap>,
-  frame: FrameNode,
-): Promise<void> {
-  const bg = await getNode(bgId);
-  if (!bg || bg.type === "DOCUMENT" || bg.type === "PAGE") return;
-  const snap = before.get(bgId) ?? snapAbs(bg as SceneNode);
-  const frameAbs = frame.absoluteBoundingBox;
-  if (!snap || !frameAbs) return;
-  applyAbsoluteAt(
-    bg as SceneNode,
-    snap.x - frameAbs.x,
-    snap.y - frameAbs.y,
-    snap.w,
-    snap.h,
-  );
 }
 
 async function applyFrameSpec(
@@ -290,42 +291,84 @@ async function applyFrameSpec(
   const preChildren = snapTree(frame);
 
   try {
-    // Never fold backgrounds — pin absolute at original box instead.
-    const bgId = spec.foldBackgroundId || spec.stretchBackgroundId;
-    if (bgId) {
-      await pinBackgroundAbsolute(bgId, before, frame);
-    }
-
     for (const wrapper of spec.wrappers) {
       await createWrapperFrame(frame, wrapper, before);
     }
 
-    // Absolute children at snapshot-relative coords
-    const frameAbsNow = frame.absoluteBoundingBox;
+    // Snapshot after nested wrappers exist — used if parent AL must roll back alone.
+    const mid = snapTree(frame);
+    const wrapDrift = driftedIds(frame, before);
+    if (wrapDrift.length > 0) {
+      tidyWarn(
+        `Reverted wrappers on "${frame.name}" — would shift ${wrapDrift.length} layer(s)`,
+      );
+      restoreFramePixelPerfect(frame, before);
+      return;
+    }
+
+    const bgId = spec.foldBackgroundId || spec.stretchBackgroundId;
+    let bg: SceneNode | null = null;
+    if (bgId) {
+      const n = await getNode(bgId);
+      if (n && n.type !== "DOCUMENT" && n.type !== "PAGE") {
+        bg = n as SceneNode;
+      }
+    }
+    const overlayNodes: {
+      node: SceneNode;
+      abs: (typeof spec.absoluteChildren)[number];
+    }[] = [];
     for (const abs of spec.absoluteChildren) {
       const child = await getNode(abs.nodeId);
       if (!child || child.type === "DOCUMENT" || child.type === "PAGE")
         continue;
-      const snap = before.get(abs.nodeId);
-      if (snap && frameAbsNow) {
-        applyAbsoluteAt(
-          child as SceneNode,
-          snap.x - frameAbsNow.x,
-          snap.y - frameAbsNow.y,
-          snap.w,
-          snap.h,
-        );
-      } else {
-        applyAbsoluteAt(child as SceneNode, abs.x, abs.y);
-      }
+      overlayNodes.push({ node: child as SceneNode, abs });
     }
+
+    const pinAbsoluteChildren = () => {
+      const frameAbsNow = frame.absoluteBoundingBox;
+      if (bg) {
+        const snap = before.get(bg.id) ?? snapAbs(bg);
+        if (snap && frameAbsNow) {
+          applyAbsoluteAt(
+            bg,
+            snap.x - frameAbsNow.x,
+            snap.y - frameAbsNow.y,
+            snap.w,
+            snap.h,
+          );
+        }
+      }
+      for (const { node: child, abs } of overlayNodes) {
+        const snap = before.get(abs.nodeId);
+        if (snap && frameAbsNow) {
+          applyAbsoluteAt(
+            child,
+            snap.x - frameAbsNow.x,
+            snap.y - frameAbsNow.y,
+            snap.w,
+            snap.h,
+          );
+        } else {
+          applyAbsoluteAt(child, abs.x, abs.y);
+        }
+      }
+    };
 
     if (spec.layout) {
       const w = frameSnap?.w ?? frame.width;
       const h = frameSnap?.h ?? frame.height;
+      const absoluteIds = new Set(
+        [
+          spec.foldBackgroundId,
+          spec.stretchBackgroundId,
+          ...spec.absoluteChildren.map((a) => a.nodeId),
+        ].filter((id): id is string => Boolean(id)),
+      );
 
-      // Pin every non-absolute direct child to FIXED before reflow.
+      // Pin flow children to FIXED before enabling Auto Layout so reflow cannot resize them.
       for (const child of [...frame.children]) {
+        if (absoluteIds.has(child.id)) continue;
         if (
           "layoutPositioning" in child &&
           (child as FrameNode).layoutPositioning === "ABSOLUTE"
@@ -341,7 +384,7 @@ async function applyFrameSpec(
 
       applyAutoLayout(frame, {
         ...spec.layout,
-        // Prefer MIN alignment for pixel stability unless SPACE_BETWEEN was inferred.
+        // Only honor MAX/CENTER when inference explicitly detected them; otherwise MIN for stability.
         counterAxisAlignItems:
           spec.layout.counterAxisAlignItems === "MAX" ||
           spec.layout.counterAxisAlignItems === "CENTER"
@@ -352,7 +395,25 @@ async function applyFrameSpec(
       frame.primaryAxisSizingMode = "FIXED";
       frame.counterAxisSizingMode = "FIXED";
 
-      // Re-pin after reflow (AL can still nudge hug text, etc.)
+      // Pull overlays/backgrounds out of the flow before padding can stack them.
+      for (const child of [...frame.children]) {
+        if (!absoluteIds.has(child.id)) continue;
+        try {
+          if ("layoutPositioning" in child) {
+            (child as FrameNode).layoutPositioning = "ABSOLUTE";
+          }
+        } catch (e) {
+          logError(
+            `layoutPositioning ABSOLUTE failed (${safeNodeRef(child)})`,
+            e,
+          );
+        }
+      }
+
+      // ABSOLUTE is only valid after the parent has Auto Layout.
+      pinAbsoluteChildren();
+
+      // Auto Layout can still nudge text/hug nodes — re-pin from the snapshot.
       for (const child of [...frame.children]) {
         if (
           "layoutPositioning" in child &&
@@ -374,15 +435,31 @@ async function applyFrameSpec(
         const snap = before.get(child.id) ?? preChildren.get(child.id);
         if (snap) pinFixedSize(child, snap.w, snap.h);
       }
+    } else {
+      pinAbsoluteChildren();
     }
 
-    // Validate this frame subtree against the pre-tidy snapshot.
+    // Revert this frame if any descendant moved — convert must see identical pixels.
+    // Prefer keeping successful nested wrappers when only the parent stack drifts.
     const bad = driftedIds(frame, before);
     if (bad.length > 0) {
-      tidyWarn(
-        `Reverted Auto Layout on "${frame.name}" — would shift ${bad.length} layer(s)`,
-      );
-      restoreFramePixelPerfect(frame, before);
+      if (spec.wrappers.length > 0) {
+        tidyWarn(
+          `Kept nested wrappers on "${frame.name}" — parent Auto Layout reverted (${bad.length} layer(s))`,
+        );
+        revertParentAutoLayoutKeepWrappers(frame, mid);
+        if (driftedIds(frame, before).length > 0) {
+          tidyWarn(
+            `Reverted Auto Layout on "${frame.name}" — would shift ${bad.length} layer(s)`,
+          );
+          restoreFramePixelPerfect(frame, before);
+        }
+      } else {
+        tidyWarn(
+          `Reverted Auto Layout on "${frame.name}" — would shift ${bad.length} layer(s)`,
+        );
+        restoreFramePixelPerfect(frame, before);
+      }
     }
   } finally {
     if (wasLocked) frame.locked = true;
@@ -390,10 +467,8 @@ async function applyFrameSpec(
 }
 
 /**
- * Apply a TidyPlan to the live clone tree.
- * Mutates Figma nodes; call while isTidying is true.
- * Guarantees: if Auto Layout would move pixels, that frame is reverted
- * to freeform absolute matching the pre-tidy snapshot.
+ * Mutates the clone tree in place. Any frame that would shift pixels is rolled back
+ * to freeform absolute positions matching the pre-apply snapshot.
  */
 export async function applyTidyPlan(
   plan: TidyPlan,
@@ -423,6 +498,16 @@ export async function applyTidyPlan(
 
   const mapId = (id: string) => idRemap.get(id) ?? id;
 
+  const remapWrapper = (wrapper: WrapperSpec) => {
+    wrapper.childNodeIds = wrapper.childNodeIds.map(mapId);
+    for (const sizing of wrapper.childSizing) {
+      sizing.nodeId = mapId(sizing.nodeId);
+    }
+    for (const nested of wrapper.wrappers ?? []) {
+      remapWrapper(nested);
+    }
+  };
+
   for (const spec of plan.frames) {
     spec.nodeId = mapId(spec.nodeId);
     if (spec.foldBackgroundId) {
@@ -438,27 +523,29 @@ export async function applyTidyPlan(
       sizing.nodeId = mapId(sizing.nodeId);
     }
     for (const wrapper of spec.wrappers) {
-      wrapper.childNodeIds = wrapper.childNodeIds.map(mapId);
-      for (const sizing of wrapper.childSizing) {
-        sizing.nodeId = mapId(sizing.nodeId);
-      }
+      remapWrapper(wrapper);
     }
   }
 
-  // Snapshot AFTER group→frame (should be visually identical) and BEFORE AL.
+  // Snapshot after group→frame conversion (visually identical) but before Auto Layout runs.
   const before = snapTree(root);
 
+  // Deepest frames first so parent layout sees finalized child structure.
   const ordered = [...plan.frames].reverse();
   for (const spec of ordered) {
     await applyFrameSpec(spec, before);
   }
 
-  // Final whole-tree check — restore any remaining drift on the root frame.
-  const finalBad = driftedIds(root, before);
-  if (finalBad.length > 0 && root.type === "FRAME") {
-    tidyWarn(
-      `Final pixel check failed (${finalBad.length} layers) — restoring freeform on root`,
-    );
-    restoreFramePixelPerfect(root as FrameNode, before);
+  // Do not restoreFramePixelPerfect the page when it is already a flow stack —
+  // that sets layoutMode NONE and leaves sections on absolute Y from the page top.
+  const page = root.type === "FRAME" ? (root as FrameNode) : null;
+  if (page && page.layoutMode === "NONE") {
+    const finalBad = driftedIds(root, before);
+    if (finalBad.length > 0) {
+      tidyWarn(
+        `Final pixel check failed (${finalBad.length} layers) — restoring freeform on root`,
+      );
+      restoreFramePixelPerfect(page, before);
+    }
   }
 }

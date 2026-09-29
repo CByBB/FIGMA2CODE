@@ -1,17 +1,27 @@
 /**
- * Asset export for ZIP + conversion (ported accuracy rules from figma-code plugin).
+ * Main-thread asset export for ZIP downloads: decides SVG vs PNG targets,
+ * calls exportAsync with accuracy rules from the legacy figma-code plugin,
+ * and streams each file to the UI via zipFile messages.
  */
 import { ZipFileMessage } from "types";
 import { CachedAsset, clearAssetCache, setAssetCache } from "./cache";
 import { postBackendMessage } from "../messaging";
 import { EXPORT_TIMEOUT_MS, withTimeout } from "../convert/media/exportAsync";
+import { logError, safeNodeRef } from "../shared/log";
+import { fixSvgLinearGradients } from "../convert/nodes/fixSvgGradients";
+import {
+  prepareWebFontAvailability,
+  textUsesUnavailableFont,
+} from "./googleFonts";
+import { commonLetterSpacing } from "../convert/layout/text";
+import { utf8Decode, utf8Encode } from "../shared/utf8";
 
 const VECTOR_TYPES = new Set([
   "VECTOR",
   "BOOLEAN_OPERATION",
   "STAR",
   "LINE",
-  // Plugin API uses POLYGON; REST / JSON_REST_V1 uses REGULAR_POLYGON
+  /** Plugin API name; REST / JSON_REST_V1 uses REGULAR_POLYGON */
   "POLYGON",
   "REGULAR_POLYGON",
 ]);
@@ -92,7 +102,7 @@ function hasVisiblePaint(node: SceneNode): boolean {
         return true;
     }
   } catch {
-    /* ignore */
+    return false;
   }
   return false;
 }
@@ -103,7 +113,39 @@ function shouldExportShapeAsSvg(node: SceneNode): boolean {
   return hasVisiblePaint(node);
 }
 
+/**
+ * Short tracked Latin labels (MISSION, VISION, PRODUCT, …). Browser webfonts
+ * + letter-spacing + a FIXED box that hugs the Figma AABB can mash glyphs into
+ * an unreadable cluster next to the FILL divider. Outline = Figma's paint.
+ */
+function textNeedsOutlineForTracking(node: TextNode): boolean {
+  try {
+    const chars = String(node.characters || "");
+    if (!chars || chars.includes("\n") || chars.length > 24) return false;
+    // ASCII / common punctuation only — leave CJK body copy as HTML.
+    if (![...chars].every((c) => c.charCodeAt(0) <= 0x7e)) return false;
+    const fontSize = typeof node.fontSize === "number" ? node.fontSize : 0;
+    if (fontSize <= 0) return false;
+    let ls = 0;
+    try {
+      if (node.letterSpacing && node.letterSpacing !== figma.mixed) {
+        ls = commonLetterSpacing(
+          node.letterSpacing as LetterSpacing | number,
+          fontSize,
+        );
+      }
+    } catch {
+      return false;
+    }
+    return Math.abs(ls) >= 0.5;
+  } catch {
+    return false;
+  }
+}
+
 function shouldExportTextAsSvg(node: TextNode): boolean {
+  if (textUsesUnavailableFont(node)) return true;
+  if (textNeedsOutlineForTracking(node)) return true;
   try {
     const fills = node.fills;
     if (!Array.isArray(fills)) return false;
@@ -131,7 +173,7 @@ function shouldExportTextAsSvg(node: TextNode): boolean {
       }
     }
   } catch {
-    /* ignore */
+    return false;
   }
   return false;
 }
@@ -161,6 +203,14 @@ function countVectorDescendants(node: SceneNode): {
   return { vector, total, hasText, hasMask };
 }
 
+function hasDirectMaskChild(node: SceneNode): boolean {
+  if (!("children" in node) || node.children.length === 0) return false;
+  return node.children.some(
+    (c) =>
+      "isMask" in c && (c as BlendMixin & { isMask?: boolean }).isMask === true,
+  );
+}
+
 function shouldExportAsRaster(node: SceneNode): boolean {
   if (!("children" in node)) {
     return hasImageFill(node) && !("children" in node);
@@ -172,7 +222,11 @@ function shouldExportAsRaster(node: SceneNode): boolean {
     return true;
   }
   const { vector, total, hasText, hasMask } = countVectorDescendants(node);
-  if (hasText || hasMask) return false;
+  if (hasText) return false;
+  // Reconstructing Figma masks in HTML misses the clip (mask layer painted as
+  // content, siblings unclipped). Flatten illustration mask groups to PNG.
+  if (hasDirectMaskChild(node) && vector >= 1) return true;
+  if (hasMask) return false;
   return vector >= 6 && total > 0 && vector / total >= 0.65;
 }
 
@@ -182,9 +236,7 @@ function isIconLikeComponent(node: SceneNode): boolean {
   if (!box) return false;
   const { width: w, height: h } = box;
   if (w < 8 || h < 8 || w > 96 || h > 96) {
-    // still allow if mostly vectors and no text
-  } else {
-    /* ok size */
+    /* oversized instances are filtered below via name / variant checks */
   }
   const name = (node.name || "").toLowerCase();
   if (
@@ -200,12 +252,10 @@ function isIconLikeComponent(node: SceneNode): boolean {
       node.componentProperties &&
       Object.keys(node.componentProperties).length > 0
     ) {
-      // variants often not pure icons — still allow small shells
+      /** Variant instances are rarely pure icons; allow only small shells */
       if (Math.max(w, h) > 96) return false;
     }
-  } catch {
-    /* ignore */
-  }
+  } catch {}
   const { vector, hasText } = countVectorDescendants(node);
   if (hasText) return false;
   return vector >= 1 || (w >= 8 && h >= 8 && w <= 96 && h <= 96);
@@ -321,6 +371,10 @@ async function trySettings(
       return { bytes, format: settings.format };
     } catch (err) {
       lastErr = err;
+      logError(
+        `exportAsync failed for ${target.type}:${target.id} ${settings.format}`,
+        err,
+      );
     }
   }
   await sleep(80);
@@ -334,6 +388,7 @@ async function trySettings(
     return { bytes, format: last.format };
   } catch (err) {
     lastErr = err;
+    logError(`exportAsync retry failed for ${target.type}:${target.id}`, err);
   }
   throw lastErr || new Error("exportAsync failed");
 }
@@ -416,13 +471,18 @@ function nodeLayoutFlags(
     if ("relativeTransform" in node) {
       const m = (node as LayoutMixin).relativeTransform;
       const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
-      if (det < 0) {
+      // Reflections only. Pure rotations (det ≈ +1) can still have m[0][0] < 0
+      // at ±180° — that must not be treated as flipHorizontal.
+      if (det < -1e-6) {
         flags.flipHorizontal = m[0][0] < 0;
         flags.flipVertical = m[1][1] < 0;
+        if (!flags.flipHorizontal && !flags.flipVertical) {
+          flags.flipHorizontal = true;
+        }
       }
     }
   } catch {
-    /* ignore */
+    return flags;
   }
   return flags;
 }
@@ -446,7 +506,7 @@ function pathOnlyAsset(
   };
 }
 
-/** Assign assets/* paths without calling exportAsync. */
+/** Plan assets/* paths and cache flags without calling exportAsync (live preview). */
 export function planAssetTargets(roots: readonly SceneNode[]): void {
   clearAssetCache();
   const cache = new Map<string, CachedAsset>();
@@ -463,7 +523,7 @@ export function planAssetTargets(roots: readonly SceneNode[]): void {
 async function exportImageNodePng(node: SceneNode): Promise<ExportResult> {
   const attempts = pngAttempts();
 
-  // Prefer node-rendered PNG (scaleMode + effects). Clear rotation for framed size.
+  /** PNG from the node preserves scaleMode and effects; rotation is cleared for layout size. */
   const originalRotation =
     "rotation" in node ? (node as LayoutMixin).rotation : 0;
   let clearedRotation = false;
@@ -472,9 +532,7 @@ async function exportImageNodePng(node: SceneNode): Promise<ExportResult> {
       (node as LayoutMixin).rotation = 0;
       clearedRotation = true;
     }
-  } catch {
-    /* ignore */
-  }
+  } catch {}
 
   try {
     return await withUnclippedAncestors(node, async () => {
@@ -487,9 +545,7 @@ async function exportImageNodePng(node: SceneNode): Promise<ExportResult> {
     if (clearedRotation && "rotation" in node) {
       try {
         (node as LayoutMixin).rotation = originalRotation;
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     }
   }
 }
@@ -499,29 +555,34 @@ async function exportNodeBytes(
   format: ExportFormat,
 ): Promise<ExportResult> {
   const attempts = pngAttempts();
-  const svgAttempts: ExportSettingsSVGString[] = [
-    { format: "SVG", svgIdAttribute: true } as any,
-    { format: "SVG" } as any,
+  const svgAttempts: ExportSettingsSVG[] = [
+    { format: "SVG", svgIdAttribute: true },
+    { format: "SVG" },
   ];
 
   if (format === "PNG" && hasImageFill(node)) {
     try {
       return await exportImageNodePng(node);
-    } catch {
-      /* fall through */
+    } catch (e) {
+      logError(`PNG image-fill export failed (${safeNodeRef(node)})`, e);
     }
   }
 
   if (format === "SVG" && node.type === "TEXT") {
-    return trySettings(node, svgAttempts as ExportSettings[]);
+    // Outline glyphs. A <text font-family="…"> SVG still needs the missing face.
+    return trySettings(node, [
+      { format: "SVG", svgOutlineText: true, svgIdAttribute: true },
+      { format: "SVG", svgOutlineText: true },
+    ]);
   }
 
   if (format === "SVG") {
     try {
       return await withUnclippedAncestors(node, () =>
-        trySettings(node, svgAttempts as ExportSettings[]),
+        trySettings(node, svgAttempts),
       );
-    } catch {
+    } catch (e) {
+      logError(`SVG export failed (${safeNodeRef(node)})`, e);
       return withUnclippedAncestors(node, () => trySettings(node, attempts));
     }
   }
@@ -594,12 +655,13 @@ function annotateDocument(
 async function serializeRoot(root: SceneNode): Promise<any> {
   try {
     const rest = await root.exportAsync({ format: "JSON_REST_V1" } as any);
-    // exportAsync JSON_REST_V1 returns { document: ... } wrapping
+    /** JSON_REST_V1 wraps the tree in { document } */
     const payload = rest as any;
     if (payload && payload.document) return payload.document;
     return payload;
-  } catch {
-    // minimal fallback
+  } catch (e) {
+    logError("REST JSON serialize failed", e);
+    /** Minimal node stub when REST export is unavailable */
     return {
       id: root.id,
       name: root.name,
@@ -626,7 +688,7 @@ function postZipFile(path: string, bytes: Uint8Array): void {
   } as ZipFileMessage);
 }
 
-/** Export assets, stream each file, keep path+flags only in cache. */
+/** Export assets, stream each file to the UI, then retain path + flags in cache. */
 export async function exportZipAssets(
   roots: readonly SceneNode[],
 ): Promise<ZipExportResult> {
@@ -649,6 +711,7 @@ export async function exportZipAssets(
     percent: 5,
   });
 
+  await prepareWebFontAvailability(roots);
   const document = await serializeRoot(root);
   const targets: Target[] = [];
   for (const r of roots) collectExportTargets(r, targets);
@@ -672,13 +735,23 @@ export async function exportZipAssets(
       const result = await exportNodeBytes(node, planned);
       const actual: ExportFormat = result.format === "SVG" ? "SVG" : "PNG";
       if (actual !== planned) formatDrift = true;
+      let bytes = result.bytes;
+      if (actual === "SVG") {
+        try {
+          bytes = utf8Encode(
+            fixSvgLinearGradients(utf8Decode(result.bytes), node),
+          );
+        } catch (e) {
+          logError(`SVG gradient fix failed (${safeNodeRef(node)})`, e);
+        }
+      }
       const rel = assetRelPath(node, actual);
       assetsMap[node.id] = rel;
-      postZipFile(rel, result.bytes);
+      postZipFile(rel, bytes);
       cache.set(node.id, pathOnlyAsset(node, actual, rel));
-    } catch (err) {
+    } catch (e) {
+      logError(`asset export failed (${safeNodeRef(node)})`, e);
       failed += 1;
-      console.warn("[zipAssets] export failed", node.id, node.name, err);
     }
     if (i % 5 === 0 || i === unique.length - 1) {
       const pct = 12 + Math.round(((i + 1) / Math.max(unique.length, 1)) * 55);

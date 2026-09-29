@@ -1,8 +1,10 @@
+// Builds the color/gradient swatch lists shown in the UI from the current selection.
 import { rgbTo6hex } from "./color/rgb";
 import { htmlColorFromFill, htmlGradientFromFills } from "./html/color";
 import { calculateContrastRatio } from "./contrast";
 import { LinearGradientConversion, SolidColorConversion } from "types";
 import { processColorVariables } from "./nodes/toJson";
+import { logError } from "../shared/log";
 
 export const retrieveGenericSolidUIColors = async (): Promise<
   Array<SolidColorConversion>
@@ -78,7 +80,7 @@ export const retrieveGenericLinearGradients = async (): Promise<
                   .toLowerCase();
               }
             } catch (e) {
-              console.error("Error retrieving variable for gradient stop:", e);
+              logError("color variable lookup failed", e);
             }
           }
         }

@@ -1,7 +1,11 @@
+/** Creates an off-source clone for tidy; source selection stays untouched for convert rollback. */
+
 import type { ResolvedTarget } from "./target";
 import { Rect, parentAbsRect, unionRect } from "./geometry";
+import { transformOriginOffset } from "./preserve";
 import { PLUGIN_DATA_CLONE, PLUGIN_DATA_SOURCE, TIDY_GAP } from "./types";
 import { tidyWarn } from "./warnings";
+import { logError } from "../shared/log";
 
 export type CloneResult = {
   root: SceneNode;
@@ -31,12 +35,19 @@ function absBox(node: SceneNode): Rect | null {
 async function removePreviousClone(source: SceneNode): Promise<void> {
   const cloneId = source.getPluginData(PLUGIN_DATA_CLONE);
   if (!cloneId) return;
-  const existing = await figma.getNodeByIdAsync(cloneId);
+  let existing: BaseNode | null = null;
+  try {
+    existing = await figma.getNodeByIdAsync(cloneId);
+  } catch (e) {
+    logError(`getNodeByIdAsync failed for previous clone ${cloneId}`, e);
+    source.setPluginData(PLUGIN_DATA_CLONE, "");
+    return;
+  }
   if (existing) {
     try {
       if (existing.parent) existing.remove();
     } catch (e) {
-      console.warn("[tidy] failed to remove previous clone", e);
+      logError("failed to remove previous tidy clone", e);
     }
   }
   source.setPluginData(PLUGIN_DATA_CLONE, "");
@@ -55,8 +66,8 @@ function placeOnPage(node: SceneNode, origin: Rect): void {
 }
 
 /**
- * Clone a COMPONENT main into a plain FRAME with cloned children
- * (do not duplicate the main component).
+ * Duplicate a component main as a plain frame so tidy can restructure without
+ * creating a second component definition.
  */
 function cloneComponentAsFrame(component: ComponentNode): FrameNode {
   const frame = figma.createFrame();
@@ -90,6 +101,7 @@ function cloneComponentAsFrame(component: ComponentNode): FrameNode {
   }
 
   for (const child of component.children) {
+    if (child.visible === false) continue;
     const c = cloneSceneNode(child);
     frame.appendChild(c);
     c.x = child.x;
@@ -124,8 +136,9 @@ function wrapNodesInFrame(
     const clone = cloneSceneNode(node);
     frame.appendChild(clone);
     if (box) {
-      clone.x = box.x - union.x;
-      clone.y = box.y - union.y;
+      const { dx, dy } = transformOriginOffset(node);
+      clone.x = box.x - union.x + dx;
+      clone.y = box.y - union.y + dy;
     }
   }
 
@@ -133,7 +146,7 @@ function wrapNodesInFrame(
 }
 
 /**
- * Build the visible tidied clone on the current page and return its root.
+ * Place the tidied clone beside the source via pluginData links so repeat runs replace the old clone.
  */
 export async function createTidyClone(
   target: ResolvedTarget,
