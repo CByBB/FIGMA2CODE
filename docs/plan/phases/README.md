@@ -4,6 +4,8 @@ Companion to [../plan-verified-agent.md](../plan-verified-agent.md).
 
 This folder is the **day-by-day build plan**. Root notes live here. Each phase is its own file with detailed tasks and PASS/FAIL switches.
 
+**System logic diagram (single source):** [FLOW.md](./FLOW.md)
+
 ---
 
 ## How to use
@@ -37,7 +39,7 @@ flowchart TD
 | P4    | [P4-responsive.md](./P4-responsive.md)         | Declared mobile + motion                               |
 | P5    | [P5-ship.md](./P5-ship.md)                     | Plugin UX over bridge, ZIP, report                     |
 
-Shared: [STACK.md](./STACK.md) · [LOCAL-BRIDGE.md](./LOCAL-BRIDGE.md) (plugin ↔ local agent; **not** Figma MCP).
+Shared: [STACK.md](./STACK.md) · [LOCAL-BRIDGE.md](./LOCAL-BRIDGE.md) · [FLOW.md](./FLOW.md) (all-in-one diagram).
 
 ---
 
@@ -53,16 +55,7 @@ Shared: [STACK.md](./STACK.md) · [LOCAL-BRIDGE.md](./LOCAL-BRIDGE.md) (plugin �
 | **Figma role**    | Input sensor via plugin. Do not mutate canvas as the tidy IR long-term.                   |
 | **Runtime split** | Plugin ↔ **localhost bridge** ↔ Node agent (verify, OpenRouter, Langfuse, ZIP).           |
 
-```mermaid
-flowchart LR
-  Desk["Figma Desktop"] --> Plug["Plugin<br/>Plugin API"]
-  Plug <-->|"localhost :8787<br/>HTTP + WebSocket"| Node["Node agent"]
-  Node --> Langfuse["Langfuse"]
-  Node --> OR["OpenRouter multi-model"]
-  Node --> ZIP["ZIP + report + .runs/"]
-```
-
-Live selection can stream snapshots anytime; **OpenRouter convert stays explicit** (user click) so browsing the file does not spend tokens. Details: [LOCAL-BRIDGE.md](./LOCAL-BRIDGE.md).
+Live selection can stream snapshots anytime; **OpenRouter convert stays explicit** (user click). Full picture: [FLOW.md](./FLOW.md). Bridge details: [LOCAL-BRIDGE.md](./LOCAL-BRIDGE.md).
 
 ---
 
