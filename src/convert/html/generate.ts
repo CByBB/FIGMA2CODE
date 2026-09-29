@@ -268,6 +268,11 @@ const svgFileLayoutNode = (node: SceneNode): SceneNode => {
  * (renderBounds), but node.width/height stay on the layout AABB. Sizing the
  * <img> to the AABB (e.g. Hero Portrait 439×685 vs PNG 499×745) squashes the
  * subject and shifts it down/sideways vs Figma.
+ *
+ * Do NOT use renderBounds when it is smaller than the AABB — that is usually
+ * an ancestor clip (test5 `k-top__bg_route` 1920×574 frame, renderBounds
+ * 1472×574). PNG export is still the full frame; sizing to the clipped box
+ * horizontally squashes the wavy divider vs design.
  */
 const imageFillLayoutNode = (node: SceneNode): SceneNode => {
   if (!("fills" in node) || !nodeHasImageFill(node)) return node;
@@ -295,6 +300,15 @@ const imageFillLayoutNode = (node: SceneNode): SceneNode => {
   ) {
     return node;
   }
+
+  // Ancestor clip: renderBounds is a subset of the layout box (same as SVG).
+  const clippedSubset =
+    box.x >= aabb.x - 0.5 &&
+    box.y >= aabb.y - 0.5 &&
+    box.x + box.width <= aabb.x + aabb.width + 0.5 &&
+    box.y + box.height <= aabb.y + aabb.height + 0.5 &&
+    (box.width < aabb.width - 0.5 || box.height < aabb.height - 0.5);
+  if (clippedSubset) return node;
 
   const parentBox =
     node.parent && "absoluteBoundingBox" in node.parent

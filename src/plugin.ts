@@ -305,6 +305,14 @@ const standardMode = async () => {
   figma.ui.onmessage = async (msg) => {
     if (msg.type === "ui-ready") {
       await initializeOnce();
+      // Re-sync every time. initSettings may have posted before the iframe
+      // attached window.onmessage, so the first openRouterKeyStatus is dropped
+      // and the UI looks like the key was cleared after reload.
+      if (userPluginSettings) {
+        postSettingsChanged(userPluginSettings);
+      }
+      const hasKey = await hasOpenRouterApiKey();
+      postBackendMessage({ type: "openRouterKeyStatus", hasKey });
     } else if (msg.type === "pluginSettingWillChange") {
       const { key, value } = msg as SettingWillChangeMessage<unknown>;
       (userPluginSettings as any)[key] = value;
@@ -317,6 +325,9 @@ const standardMode = async () => {
     } else if (msg.type === "setOpenRouterKey") {
       const { key } = msg as SetOpenRouterKeyMessage;
       await setOpenRouterApiKey(typeof key === "string" ? key : "");
+      const hasKey = await hasOpenRouterApiKey();
+      postBackendMessage({ type: "openRouterKeyStatus", hasKey });
+    } else if (msg.type === "getOpenRouterKeyStatus") {
       const hasKey = await hasOpenRouterApiKey();
       postBackendMessage({ type: "openRouterKeyStatus", hasKey });
     } else if (msg.type === "requestFullCode") {
@@ -366,10 +377,11 @@ const standardMode = async () => {
    * which we avoid for memory. Selection changes, settings, and explicit tidy
    * are enough to refresh preview output.
    *
-   * Also call initializeOnce immediately — ui-ready may arrive before onmessage
-   * is attached.
+   * Do NOT call initializeOnce() here before the UI listens — postMessage from
+   * initSettings (openRouterKeyStatus / settings) is dropped and the About panel
+   * shows “No key” after every reload even though clientStorage still has it.
+   * ui-ready is the single sync point (onmessage is registered above showUI).
    */
-  void initializeOnce();
 };
 
 const codegenMode = async () => {

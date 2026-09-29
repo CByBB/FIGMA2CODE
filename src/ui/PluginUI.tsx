@@ -42,6 +42,7 @@ type PluginUIProps = {
   onDownloadZip?: () => void;
   onTidyAndConvert?: () => void;
   onSaveOpenRouterKey?: (key: string) => void;
+  onClearOpenRouterKey?: () => void;
   previewMode: PreviewMode;
   figmaJson: string;
   jsonLineCount: number;
@@ -206,6 +207,7 @@ export const PluginUI = (props: PluginUIProps) => {
               hasOpenRouterKey={Boolean(props.hasOpenRouterKey)}
               onPreferenceChanged={props.onPreferenceChanged}
               onSaveOpenRouterKey={props.onSaveOpenRouterKey}
+              onClearOpenRouterKey={props.onClearOpenRouterKey}
             />
           ) : (
             <div className="flex flex-col items-center px-4 pt-3 pb-2 gap-2 dark:bg-transparent min-h-full">

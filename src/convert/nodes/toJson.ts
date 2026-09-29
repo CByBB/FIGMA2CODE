@@ -264,7 +264,7 @@ const processNodePair = async (
   // Prefer live visibility: REST sometimes omits `visible`, and tidy may disagree with JSON.
   if (jsonNode.visible === false || figmaNode.visible === false) return null;
 
-  const nodeType = jsonNode.type;
+  let nodeType = jsonNode.type;
 
   // GROUP rotation is distributed to children; cumulativeRotation tracks inherited angle.
   if (parentNode) {
@@ -294,46 +294,64 @@ const processNodePair = async (
   }
 
   // GROUPs are flattened: children are hoisted with inherited rotation, group node is dropped.
+  // Exception: inside Auto Layout, hoisting turns former group-siblings into separate flex
+  // items along the parent's axis (test5: Div[main] GROUP → Footer sits beside the sidebar).
+  let keptGroupAsFrame = false;
   if (nodeType === "GROUP" && jsonNode.children) {
-    const processedChildren = [];
+    const parentLayout =
+      parentNode && "layoutMode" in parentNode
+        ? (parentNode as { layoutMode?: string }).layoutMode
+        : undefined;
+    const parentIsAutoLayout = parentLayout != null && parentLayout !== "NONE";
 
-    if (
-      Array.isArray(jsonNode.children) &&
-      figmaNode &&
-      "children" in figmaNode
-    ) {
-      const visibleJsonChildren = jsonNode.children.filter(
-        (child) => child.visible !== false,
-      ) as RestAltNode[];
+    if (!parentIsAutoLayout) {
+      const processedChildren = [];
 
-      const figmaChildrenById = new Map();
-      figmaNode.children.forEach((child) => {
-        figmaChildrenById.set(child.id, child);
-      });
+      if (
+        Array.isArray(jsonNode.children) &&
+        figmaNode &&
+        "children" in figmaNode
+      ) {
+        const visibleJsonChildren = jsonNode.children.filter(
+          (child) => child.visible !== false,
+        ) as RestAltNode[];
 
-      for (const child of visibleJsonChildren) {
-        const figmaChild = figmaChildrenById.get(child.id);
-        if (!figmaChild) continue;
+        const figmaChildrenById = new Map();
+        figmaNode.children.forEach((child) => {
+          figmaChildrenById.set(child.id, child);
+        });
 
-        const processedChild = await processNodePair(
-          child,
-          figmaChild,
-          settings,
-          parentNode,
-          parentCumulativeRotation + (jsonNode.rotation || 0),
-        );
+        for (const child of visibleJsonChildren) {
+          const figmaChild = figmaChildrenById.get(child.id);
+          if (!figmaChild) continue;
 
-        if (processedChild !== null) {
-          if (Array.isArray(processedChild)) {
-            processedChildren.push(...processedChild);
-          } else {
-            processedChildren.push(processedChild);
+          const processedChild = await processNodePair(
+            child,
+            figmaChild,
+            settings,
+            parentNode,
+            parentCumulativeRotation + (jsonNode.rotation || 0),
+          );
+
+          if (processedChild !== null) {
+            if (Array.isArray(processedChild)) {
+              processedChildren.push(...processedChild);
+            } else {
+              processedChildren.push(processedChild);
+            }
           }
         }
       }
+
+      return processedChildren;
     }
 
-    return processedChildren;
+    // Keep the group's AABB as one flex/grid item; children stay absolute inside.
+    (jsonNode as { type: string }).type = "FRAME";
+    (jsonNode as { layoutMode?: string }).layoutMode = "NONE";
+    (jsonNode as { isRelative?: boolean }).isRelative = true;
+    nodeType = "FRAME";
+    keptGroupAsFrame = true;
   }
 
   if (nodeType === "SLICE") {
@@ -612,7 +630,9 @@ const processNodePair = async (
 
     const cumulative =
       parentCumulativeRotation +
-      (jsonNode.type === "GROUP" ? jsonNode.rotation || 0 : 0);
+      (jsonNode.type === "GROUP" || keptGroupAsFrame
+        ? jsonNode.rotation || 0
+        : 0);
 
     const processedChildren: RestAltNode[] = [];
 

@@ -27,6 +27,11 @@ import { postUISettingsChangingMessage } from "./messaging";
 import copy from "copy-to-clipboard";
 import { logError } from "../shared/log";
 import type { PreviewMode } from "./components/CodePanel";
+import {
+  clearOpenRouterKeyBackup,
+  readOpenRouterKeyBackup,
+  writeOpenRouterKeyBackup,
+} from "./openRouterKeyBackup";
 
 interface AppState {
   codePreview: string;
@@ -66,6 +71,8 @@ const isDarkFigmaBackground = (background: string) => {
 export default function App() {
   const zipFilesRef = useRef<Map<string, Uint8Array>>(new Map());
   const previewModeRef = useRef<PreviewMode>("code");
+  /** Avoid re-pushing the same localStorage backup in a loop if main rejects it. */
+  const keyRestoreAttemptedRef = useRef(false);
   const [state, setState] = useState<AppState>({
     codePreview: "",
     lineCount: 0,
@@ -326,10 +333,23 @@ export default function App() {
 
         case "openRouterKeyStatus": {
           const status = untypedMessage as OpenRouterKeyStatusMessage;
+          const hasKey = Boolean(status.hasKey);
           setState((prevState) => ({
             ...prevState,
-            hasOpenRouterKey: Boolean(status.hasKey),
+            hasOpenRouterKey: hasKey,
           }));
+          // clientStorage empty after reload → push iframe backup once.
+          if (!hasKey && !keyRestoreAttemptedRef.current) {
+            const backup = readOpenRouterKeyBackup();
+            if (backup) {
+              keyRestoreAttemptedRef.current = true;
+              parent.postMessage(
+                { pluginMessage: { type: "setOpenRouterKey", key: backup } },
+                "*",
+              );
+            }
+          }
+          if (hasKey) keyRestoreAttemptedRef.current = false;
           break;
         }
 
@@ -381,8 +401,21 @@ export default function App() {
   };
 
   const handleSaveOpenRouterKey = (key: string) => {
+    const trimmed = key.trim();
+    if (trimmed) writeOpenRouterKeyBackup(trimmed);
+    else clearOpenRouterKeyBackup();
+    keyRestoreAttemptedRef.current = false;
     parent.postMessage(
-      { pluginMessage: { type: "setOpenRouterKey", key } },
+      { pluginMessage: { type: "setOpenRouterKey", key: trimmed } },
+      "*",
+    );
+  };
+
+  const handleClearOpenRouterKey = () => {
+    clearOpenRouterKeyBackup();
+    keyRestoreAttemptedRef.current = true; // do not auto-restore after explicit clear
+    parent.postMessage(
+      { pluginMessage: { type: "setOpenRouterKey", key: "" } },
       "*",
     );
   };
@@ -467,6 +500,7 @@ export default function App() {
         onDownloadZip={handleDownloadZip}
         onTidyAndConvert={handleTidyAndConvert}
         onSaveOpenRouterKey={handleSaveOpenRouterKey}
+        onClearOpenRouterKey={handleClearOpenRouterKey}
         previewMode={state.previewMode}
         figmaJson={state.figmaJson}
         jsonLineCount={state.jsonLineCount}

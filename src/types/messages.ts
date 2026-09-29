@@ -83,6 +83,9 @@ export type SetOpenRouterKeyMessage = Message & {
   type: "setOpenRouterKey";
   key: string;
 };
+export type GetOpenRouterKeyStatusMessage = Message & {
+  type: "getOpenRouterKeyStatus";
+};
 export type OpenRouterKeyStatusMessage = Message & {
   type: "openRouterKeyStatus";
   hasKey: boolean;

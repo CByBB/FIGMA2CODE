@@ -27,6 +27,7 @@ type AboutProps = {
     value: PluginSettings[keyof PluginSettings],
   ) => void;
   onSaveOpenRouterKey?: (key: string) => void;
+  onClearOpenRouterKey?: () => void;
 };
 
 const About = ({
@@ -34,6 +35,7 @@ const About = ({
   hasOpenRouterKey = false,
   onPreferenceChanged,
   onSaveOpenRouterKey,
+  onClearOpenRouterKey,
 }: AboutProps) => {
   const [copied, setCopied] = useState(false);
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -213,15 +215,16 @@ const About = ({
             </div>
             <p className="text-neutral-600 dark:text-neutral-300 leading-relaxed mb-3">
               Tidy + Convert uses a vision model via OpenRouter (
-              <code className="text-xs">xiaomi/mimo-v2.5</code>). Your key stays
-              in Figma client storage on this machine and is never logged in
-              full.
+              <code className="text-xs">xiaomi/mimo-v2.5</code>). Your key is
+              saved on this machine (Figma client storage + a local backup) and
+              is never logged in full. The field stays empty after save for
+              security — use Status below to confirm it is still stored.
             </p>
             <p className="text-xs text-neutral-500 dark:text-neutral-400 mb-3">
               Status:{" "}
               {hasOpenRouterKey ? (
                 <span className="text-green-600 dark:text-green-400">
-                  Key saved
+                  Key saved — survives plugin reload
                 </span>
               ) : (
                 <span className="text-amber-600 dark:text-amber-400">
@@ -248,6 +251,16 @@ const About = ({
               >
                 {keySavedFlash ? "Saved" : "Save key"}
               </Button>
+              {hasOpenRouterKey && onClearOpenRouterKey ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8 shrink-0"
+                  onClick={onClearOpenRouterKey}
+                >
+                  Clear
+                </Button>
+              ) : null}
             </div>
           </CardContent>
         </Card>

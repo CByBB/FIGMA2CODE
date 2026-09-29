@@ -140,7 +140,7 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
         {
           color: htmlColorFromFills(segment.fills as any),
           "font-size": segment.fontSize,
-          "font-family": `"${String(segment.fontName.family).replace(/"/g, "")}"`,
+          "font-family": this.fontFamilyCss(segment.fontName.family),
           "font-style": this.getFontStyle(segment.fontName.style),
           "font-weight": `${segment.fontWeight}`,
           "text-decoration": this.textDecoration(segment.textDecoration),
@@ -260,6 +260,17 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
     return "";
   }
 
+  /** Safe inside style="…": use single quotes when the family has spaces. */
+  fontFamilyCss(family: string): string {
+    const name = String(family || "")
+      .replace(/\\/g, "")
+      .replace(/'/g, "")
+      .replace(/"/g, "")
+      .trim();
+    if (!name) return "sans-serif";
+    return /[\s,]/.test(name) ? `'${name}'` : name;
+  }
+
   textAlignHorizontal(): this {
     const node = this.node as TextNode;
 
@@ -315,12 +326,12 @@ export class HtmlTextBuilder extends HtmlDefaultBuilder {
     if (this.node && (this.node as TextNode).effects) {
       const effects = (this.node as TextNode).effects;
       const blurEffect = effects.find(
-        (effect) =>
+        (effect): effect is BlurEffect =>
           effect.type === "LAYER_BLUR" &&
           effect.visible !== false &&
           effect.radius > 0,
       );
-      if (blurEffect && blurEffect.radius) {
+      if (blurEffect) {
         return `blur(${blurEffect.radius}px)`;
       }
     }
