@@ -15,7 +15,7 @@ Docs:
 
 - [docs/logic.md](docs/logic.md) — UX + conversion flow diagrams
 - [docs/user-guide.md](docs/user-guide.md) — build, import into Figma Desktop, debug consoles
-- **New agent (sibling repo):** [../verified-agent/](../verified-agent/) · [GitHub](https://github.com/CByBB/figma-verified-agent) · [plan](../verified-agent/docs/plan/plan-verified-agent.md) · [phases](../verified-agent/docs/plan/phases/README.md) · [RISKS](../verified-agent/docs/plan/RISKS.md)
+- **New agent (sibling repo):** [../verified-agent/](../verified-agent/) · [GitHub](https://github.com/CByBB/figma-verified-agent) · [plan](../verified-agent/docs/strategy.md) · [phases](../verified-agent/docs/phases/README.md) · [RISKS](../verified-agent/docs/risks.md)
 
 ## Hard cases
 
