@@ -40,6 +40,7 @@ type PluginUIProps = {
   statusMessage?: string;
   progressPercent?: number | null;
   onDownloadZip?: () => void;
+  onExportBounds?: () => void;
   onTidyAndConvert?: () => void;
   onSaveOpenRouterKey?: (key: string) => void;
   onClearOpenRouterKey?: () => void;
@@ -64,6 +65,7 @@ const ZipToolbar = ({
   hasOpenRouterKey,
   canDownloadZip,
   onDownloadZip,
+  onExportBounds,
   onTidyAndConvert,
 }: {
   statusMessage?: string;
@@ -74,6 +76,7 @@ const ZipToolbar = ({
   hasOpenRouterKey: boolean;
   canDownloadZip: boolean;
   onDownloadZip?: () => void;
+  onExportBounds?: () => void;
   onTidyAndConvert?: () => void;
 }) => {
   const busy = isLoading || isZipExporting || isTidying;
@@ -107,6 +110,16 @@ const ZipToolbar = ({
             onClick={() => onTidyAndConvert?.()}
           >
             {isTidying ? "Tidying…" : "Tidy + Convert"}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8"
+            disabled={busy || !onExportBounds}
+            title="Export Measure bounds.json (frame-top-left, Plugin API)"
+            onClick={() => onExportBounds?.()}
+          >
+            Export bounds
           </Button>
           <Button
             size="sm"
@@ -220,6 +233,7 @@ export const PluginUI = (props: PluginUIProps) => {
                 hasOpenRouterKey={Boolean(props.hasOpenRouterKey)}
                 canDownloadZip={canDownloadZip}
                 onDownloadZip={props.onDownloadZip}
+                onExportBounds={props.onExportBounds}
                 onTidyAndConvert={props.onTidyAndConvert}
               />
 

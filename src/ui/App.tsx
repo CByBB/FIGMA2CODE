@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from "react";
 import { PluginUI } from "./PluginUI";
 import { coerceIncomingBytes, downloadZipFromFiles } from "./zip";
+import { downloadJsonText } from "./downloadJson";
 import {
   PluginSettings,
   ConversionMessage,
@@ -22,6 +23,7 @@ import {
   FullCodeMessage,
   OpenRouterKeyStatusMessage,
   SelectionJsonMessage,
+  BoundsExportMessage,
 } from "types";
 import { postUISettingsChangingMessage } from "./messaging";
 import copy from "copy-to-clipboard";
@@ -331,6 +333,24 @@ export default function App() {
           break;
         }
 
+        case "boundsExport": {
+          const boundsMsg = untypedMessage as BoundsExportMessage;
+          try {
+            downloadJsonText(boundsMsg.filename, boundsMsg.jsonText);
+            setState((prevState) => ({
+              ...prevState,
+              statusMessage: `Downloaded ${boundsMsg.filename} (${boundsMsg.nodeCount} nodes)`,
+            }));
+          } catch (e) {
+            logError("bounds.json browser download failed", e);
+            setState((prevState) => ({
+              ...prevState,
+              statusMessage: "Bounds export built but browser download failed",
+            }));
+          }
+          break;
+        }
+
         case "openRouterKeyStatus": {
           const status = untypedMessage as OpenRouterKeyStatusMessage;
           const hasKey = Boolean(status.hasKey);
@@ -380,6 +400,11 @@ export default function App() {
   const handleDownloadZip = () => {
     if (state.isLoading || state.isZipExporting || state.isTidying) return;
     parent.postMessage({ pluginMessage: { type: "exportZip" } }, "*");
+  };
+
+  const handleExportBounds = () => {
+    if (state.isLoading || state.isZipExporting || state.isTidying) return;
+    parent.postMessage({ pluginMessage: { type: "exportBounds" } }, "*");
   };
 
   const handleTidyAndConvert = () => {
@@ -498,6 +523,7 @@ export default function App() {
         statusMessage={state.statusMessage}
         progressPercent={state.progressPercent}
         onDownloadZip={handleDownloadZip}
+        onExportBounds={handleExportBounds}
         onTidyAndConvert={handleTidyAndConvert}
         onSaveOpenRouterKey={handleSaveOpenRouterKey}
         onClearOpenRouterKey={handleClearOpenRouterKey}

@@ -116,3 +116,14 @@ export type SelectionJsonMessage = Message & {
   jsonLineCount?: number;
   showingFull?: boolean;
 };
+
+/** UI → main: export Measure bounds.json for the selected frame (Plugin API). */
+export type ExportBoundsMessage = Message & { type: "exportBounds" };
+
+/** Main → UI: bounds payload ready for download (or error). */
+export type BoundsExportMessage = Message & {
+  type: "boundsExport";
+  filename: string;
+  jsonText: string;
+  nodeCount: number;
+};

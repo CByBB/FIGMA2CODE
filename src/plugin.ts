@@ -7,6 +7,7 @@
 import { run, exportZipPackage, getLastPreviewHtml } from "./convert/run";
 import { htmlMain, htmlCodeGenTextStyles } from "./convert/html/generate";
 import { nodesToJSON } from "./convert/nodes/toJson";
+import { boundsFilename, exportBoundsFromSelection } from "./export/bounds";
 import { postBackendMessage, postSettingsChanged } from "./messaging";
 import { logError } from "./shared/log";
 import { isTidying, tidySelection } from "./tidy";
@@ -17,6 +18,7 @@ import {
   SetOpenRouterKeyMessage,
   SettingWillChangeMessage,
   GetSelectionJsonMessage,
+  BoundsExportMessage,
 } from "types";
 
 let userPluginSettings: PluginSettings;
@@ -363,6 +365,22 @@ const standardMode = async () => {
         data: nodeJson,
         purpose: req.purpose === "display" ? "display" : "copy",
       });
+    } else if (msg.type === "exportBounds") {
+      try {
+        const bounds = exportBoundsFromSelection(figma.currentPage.selection);
+        const root = figma.currentPage.selection[0]?.name ?? "bounds";
+        const payload: BoundsExportMessage = {
+          type: "boundsExport",
+          filename: boundsFilename(root),
+          jsonText: `${JSON.stringify(bounds, null, 2)}\n`,
+          nodeCount: Object.keys(bounds.nodes).length,
+        };
+        figma.ui.postMessage(payload);
+      } catch (e) {
+        const error = e instanceof Error ? e.message : "Bounds export failed";
+        logError("exportBounds", e);
+        postBackendMessage({ type: "error", error });
+      }
     }
   };
 
