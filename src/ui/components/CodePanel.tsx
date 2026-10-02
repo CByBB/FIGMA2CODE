@@ -3,7 +3,6 @@ import { useMemo, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { coldarkDark as theme } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { CopyButton } from "./CopyButton";
-import EmptyState from "./EmptyState";
 import { cn } from "../lib/utils";
 
 export type PreviewMode = "code" | "json";
@@ -36,7 +35,7 @@ function ViewToggle({
 
   return (
     <div
-      className="inline-flex items-center rounded-md bg-muted p-0.5"
+      className="inline-flex items-center rounded-lg bg-muted p-0.5"
       role="tablist"
       aria-label="Preview mode"
     >
@@ -50,7 +49,7 @@ function ViewToggle({
             aria-selected={selected}
             onClick={() => onChange(opt.id)}
             className={cn(
-              "h-7 rounded-[5px] px-2.5 text-xs font-medium transition-colors",
+              "h-7 rounded-md px-3 text-[11px] font-semibold transition-colors",
               selected
                 ? "bg-background text-foreground shadow-sm"
                 : "text-muted-foreground hover:text-foreground",
@@ -89,21 +88,23 @@ const CodePanel = (props: CodePanelProps) => {
 
   const sizeHint = useMemo(() => {
     if (isJsonMode) {
-      if (figmaJsonLoading) return "Loading Figma JSON…";
-      if (jsonLineCount <= 25) return null;
+      if (figmaJsonLoading) return "Loading…";
+      if (!figmaJson) return null;
+      if (jsonLineCount <= 25) return `${jsonLineCount} lines`;
       return showingFullJson
         ? `${jsonLineCount} lines`
-        : `${jsonLineCount} lines — showing first 25`;
+        : `First 25 of ${jsonLineCount}`;
     }
-    if (lineCount <= 25) return null;
-    return showingFullCode
-      ? `${lineCount} lines`
-      : `${lineCount} lines — showing first 25`;
+    if (!code || lineCount <= 0) return null;
+    if (lineCount <= 25) return `${lineCount} lines`;
+    return showingFullCode ? `${lineCount} lines` : `First 25 of ${lineCount}`;
   }, [
     isJsonMode,
     figmaJsonLoading,
+    figmaJson,
     jsonLineCount,
     showingFullJson,
+    code,
     lineCount,
     showingFullCode,
   ]);
@@ -114,37 +115,34 @@ const CodePanel = (props: CodePanelProps) => {
     : isCodeEmpty;
 
   return (
-    <div className="w-full flex flex-col gap-2 mt-2">
-      <div className="flex items-center justify-between w-full">
-        <p className="text-lg font-medium text-center text-foreground rounded-lg">
-          {isJsonMode ? "Figma JSON" : "Code"}
-        </p>
-        {!isCodeEmpty && (
-          <ViewToggle
-            value={previewMode}
-            onChange={(mode) => props.onPreviewModeChange?.(mode)}
-          />
+    <div className="mt-0 flex w-full flex-col gap-2.5">
+      <div className="flex w-full items-center justify-between gap-2">
+        <ViewToggle
+          value={previewMode}
+          onChange={(mode) => props.onPreviewModeChange?.(mode)}
+        />
+        {sizeHint && (
+          <span className="text-[10px] font-medium text-muted-foreground">
+            {sizeHint}
+          </span>
         )}
       </div>
-      {sizeHint && <p className="text-xs text-muted-foreground">{sizeHint}</p>}
 
       <div
-        className={`relative rounded-lg ring-green-600 transition-all duration-200 ${
+        className={`relative overflow-hidden rounded-lg ring-green-600 transition-all duration-200 ${
           syntaxHovered ? "ring-2" : "ring-0"
         }`}
       >
         {figmaJsonLoading && isJsonMode ? (
-          <div className="flex min-h-32 items-center justify-center rounded-lg bg-[#1B1B1B] px-4 py-8 text-sm text-neutral-400">
+          <div className="flex min-h-36 items-center justify-center rounded-lg bg-[#1B1B1B] px-4 py-8 text-[12px] text-neutral-400">
             Loading Figma JSON…
           </div>
         ) : isEmpty ? (
-          isJsonMode ? (
-            <div className="flex min-h-32 items-center justify-center rounded-lg bg-[#1B1B1B] px-4 py-8 text-sm text-neutral-400">
-              No Figma JSON for this selection
-            </div>
-          ) : (
-            <EmptyState />
-          )
+          <div className="flex min-h-36 items-center justify-center rounded-lg bg-[#1B1B1B] px-4 py-8 text-[12px] text-neutral-400">
+            {isJsonMode
+              ? "No Figma JSON for this selection"
+              : "No code yet — select a frame"}
+          </div>
         ) : (
           <>
             {showCopyButton && (
@@ -177,17 +175,18 @@ const CodePanel = (props: CodePanelProps) => {
               {displayed}
             </SyntaxHighlighter>
             {showMoreButton && (
-              <div className="flex justify-center dark:bg-[#1B1B1B] border-t dark:border-gray-700">
+              <div className="flex justify-center border-t border-white/10 bg-[#1B1B1B]">
                 <button
+                  type="button"
                   onClick={() => {
                     if (showingFull) return;
                     props.onShowMore?.();
                   }}
-                  className="text-xs w-full flex justify-center py-3 text-blue-500 hover:text-blue-400 transition-colors"
+                  className="flex w-full justify-center py-2.5 text-[11px] font-medium text-sky-400 transition-colors hover:text-sky-300"
                   aria-label="Show more. This could be slow or freeze Figma for a few seconds."
                   title="Show more. This could be slow or freeze Figma for a few seconds."
                 >
-                  {showingFull ? "Showing full document" : "Show More"}
+                  {showingFull ? "Showing full document" : "Show more"}
                 </button>
               </div>
             )}

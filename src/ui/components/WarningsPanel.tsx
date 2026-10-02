@@ -191,20 +191,23 @@ const WarningsPanel: React.FC<WarningsPanelProps> = ({ warnings }) => {
 };
 
 const suggestFixForWarning = (warning: string): string => {
-  if (warning.toLowerCase().includes("missing")) {
+  const lower = warning.toLowerCase();
+  if (lower.includes("missing svg asset")) {
+    return "The layer was treated as an SVG icon/illustration, but exportAsync failed or the node id could not be resolved. Try renaming/simplifying the layer, or ungroup nested masks so it can export as assets/*.svg.";
+  }
+  if (lower.includes("missing")) {
     return "Add the required properties to your component or select a parent element that includes all necessary children.";
   }
-  if (warning.toLowerCase().includes("unsupported")) {
+  if (lower.includes("unsupported")) {
     return "Consider using a different element type or simplifying the design for better conversion results.";
   }
   return "Check your design elements and ensure they follow the recommended structure for code conversion.";
 };
 
 const shouldShowActionButtons = (warning: string): boolean => {
-  return (
-    warning.toLowerCase().includes("unsupported") ||
-    warning.toLowerCase().includes("missing")
-  );
+  const lower = warning.toLowerCase();
+  if (lower.includes("missing svg asset")) return false;
+  return lower.includes("unsupported") || lower.includes("missing");
 };
 
 const getDocsLinkForWarning = (warning: string): string => {

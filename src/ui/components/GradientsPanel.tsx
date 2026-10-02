@@ -18,26 +18,24 @@ const GradientsPanel = (props: {
   };
 
   return (
-    <div className="bg-card border w-full rounded-lg p-3 flex flex-col gap-2">
-      <div className="p-0 pb-2">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-neutral-800 dark:text-neutral-100 flex items-center gap-2">
-            Gradients
-          </h2>
-          <span className="text-xs bg-muted dark:bg-muted px-2 py-1 rounded-xl text-muted-foreground">
-            {props.gradients.length} gradient
-            {props.gradients.length > 1 ? "s" : ""}
-          </span>
-        </div>
+    <div className="va-panel flex w-full flex-col gap-2">
+      <div className="flex items-center justify-between p-0 pb-1">
+        <h2 className="m-0 flex items-center gap-2 text-[13px] font-semibold text-foreground">
+          Gradients
+        </h2>
+        <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">
+          {props.gradients.length} gradient
+          {props.gradients.length > 1 ? "s" : ""}
+        </span>
       </div>
 
       <div className="grid grid-cols-3 gap-2">
         {props.gradients.map((gradient, idx) => (
           <button
             key={"button" + idx}
-            className={`w-full h-16 rounded-lg text-sm shadow-sm transition-all duration-300 ${
+            className={`h-16 w-full rounded-lg text-sm shadow-sm transition-all duration-300 ${
               isPressed === idx
-                ? "ring-4 ring-green-300 ring-opacity-50 animate-pulse"
+                ? "ring-4 ring-primary/50 animate-pulse"
                 : "ring-0"
             }`}
             style={{ background: gradient.cssPreview }}

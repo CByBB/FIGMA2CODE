@@ -24,16 +24,14 @@ const ColorsPanel = (props: {
   };
 
   return (
-    <div className="bg-card border w-full rounded-lg p-3 flex flex-col gap-2">
-      <div className="p-0 pb-2">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-foreground flex items-center gap-2">
-            Color Palette
-          </h2>
-          <span className="text-xs bg-muted dark:bg-muted px-2 py-1 rounded-xl text-muted-foreground">
-            {props.colors.length} color{props.colors.length > 1 ? "s" : ""}
-          </span>
-        </div>
+    <div className="va-panel flex w-full flex-col gap-2">
+      <div className="flex items-center justify-between p-0 pb-1">
+        <h2 className="m-0 flex items-center gap-2 text-[13px] font-semibold text-foreground">
+          Color Palette
+        </h2>
+        <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">
+          {props.colors.length} color{props.colors.length > 1 ? "s" : ""}
+        </span>
       </div>
 
       <div className="grid grid-cols-3 gap-2">

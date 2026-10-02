@@ -118,7 +118,10 @@ export default function App() {
             lineCount: 0,
             codeBytes: 0,
             showingFullCode: false,
-            statusMessage: "Generating code…",
+            colors: [],
+            gradients: [],
+            warnings: [],
+            statusMessage: "Converting selection…",
             progressPercent: null,
             isLoading: true,
             isZipExporting: false,
@@ -126,7 +129,7 @@ export default function App() {
             figmaJson: "",
             jsonLineCount: 0,
             showingFullJson: false,
-            figmaJsonLoading: previewModeRef.current === "json",
+            figmaJsonLoading: false,
           }));
           break;
 
@@ -148,12 +151,13 @@ export default function App() {
 
         case "code": {
           const conversionMessage = untypedMessage as ConversionMessage;
+          const fetchJsonAfter = previewModeRef.current === "json";
           setState((prevState) => ({
             ...prevState,
             ...conversionMessage,
             displayedCode: conversionMessage.codePreview,
             showingFullCode: false,
-            statusMessage: "Download ZIP for index.html + assets",
+            statusMessage: "Ready — Download ZIP to export",
             progressPercent: null,
             isLoading: false,
             isZipExporting: false,
@@ -161,9 +165,9 @@ export default function App() {
             figmaJson: "",
             jsonLineCount: 0,
             showingFullJson: false,
-            figmaJsonLoading: previewModeRef.current === "json",
+            figmaJsonLoading: fetchJsonAfter,
           }));
-          if (previewModeRef.current === "json") {
+          if (fetchJsonAfter) {
             parent.postMessage(
               {
                 pluginMessage: {
@@ -182,8 +186,9 @@ export default function App() {
           zipFilesRef.current.clear();
           setState((prevState) => ({
             ...prevState,
-            statusMessage: "Exporting ZIP assets…",
+            statusMessage: "Exporting assets + organizing CSS with AI…",
             progressPercent: 0,
+            isLoading: true,
             isZipExporting: true,
           }));
           break;
@@ -204,6 +209,7 @@ export default function App() {
             ...prevState,
             statusMessage: `Downloaded — index.html + ${done.assetCount} assets`,
             progressPercent: 100,
+            isLoading: false,
             isZipExporting: false,
           }));
           try {
@@ -212,6 +218,7 @@ export default function App() {
             logError("ZIP browser download failed", e);
             setState((prevState) => ({
               ...prevState,
+              isLoading: false,
               statusMessage: "ZIP built but browser download failed",
             }));
           }
@@ -224,6 +231,7 @@ export default function App() {
           zipFilesRef.current.clear();
           setState((prevState) => ({
             ...prevState,
+            isLoading: false,
             isZipExporting: false,
             progressPercent: null,
             statusMessage: zipErr.error || "ZIP export failed",
@@ -277,7 +285,7 @@ export default function App() {
           }));
           break;
 
-        case "error":
+        case "error": {
           const errorMessage = untypedMessage as ErrorMessage;
           zipFilesRef.current.clear();
           setState((prevState) => ({
@@ -300,6 +308,7 @@ export default function App() {
             figmaJsonLoading: false,
           }));
           break;
+        }
 
         case "conversion-complete":
           setState((prevState) => ({
@@ -399,6 +408,16 @@ export default function App() {
 
   const handleDownloadZip = () => {
     if (state.isLoading || state.isZipExporting || state.isTidying) return;
+    if (!state.hasOpenRouterKey) return;
+    const code = state.displayedCode;
+    if (!code || code.startsWith("Error :(")) return;
+    setState((prev) => ({
+      ...prev,
+      isLoading: true,
+      isZipExporting: true,
+      statusMessage: "Organizing CSS classes with AI…",
+      progressPercent: null,
+    }));
     parent.postMessage({ pluginMessage: { type: "exportZip" } }, "*");
   };
 
@@ -421,6 +440,9 @@ export default function App() {
       isTidying: true,
       isLoading: true,
       statusMessage: "Tidying layout…",
+      codePreview: "",
+      displayedCode: "",
+      figmaJson: "",
     }));
     parent.postMessage({ pluginMessage: { type: "tidyAndConvert" } }, "*");
   };

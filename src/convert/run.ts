@@ -18,10 +18,21 @@ import { PluginSettings } from "types";
 import { oldConvertNodesToAltNodes } from "./nodes/legacy";
 import { clearVariableCache, nodesToJSON } from "./nodes/toJson";
 import { prepareWebFontAvailability } from "../export/googleFonts";
-import { exportZipAssets, planAssetTargets } from "../export/zip";
+import {
+  exportZipAssets,
+  planAssetTargets,
+  ensureFlattenedSvgAssets,
+} from "../export/zip";
 import { clearAssetCache } from "../export/cache";
 import { applyAssetFlagsToTree } from "../export/flags";
-import { buildZipIndexHtml } from "../export/html";
+import { buildZipIndexHtml, ZIP_STYLESHEET_PATH } from "../export/html";
+import {
+  applyClassRenames,
+  extractInlineStylesToClasses,
+} from "../export/css-classes";
+import { getOpenRouterApiKey } from "../tidy/ai/key";
+import { callOpenRouterCssRefactor } from "../tidy/ai/css-refactor";
+import { OpenRouterHttpError } from "../tidy/ai/openrouter";
 import { lockedHtmlSettings } from "./settings";
 import { utf8Encode } from "../shared/utf8";
 import { logError } from "../shared/log";
@@ -101,11 +112,12 @@ export const run = async (settings: PluginSettings) => {
       return;
     }
 
-    const code = await buildZipIndexHtml(
+    const bundle = await buildZipIndexHtml(
       converted.convertedSelection,
       effectiveSettings,
       selection[0]?.name || "export",
     );
+    const code = bundle.html;
     lastPreview = { rootId: selection[0].id, html: code };
 
     const colors = await retrieveGenericSolidUIColors();
@@ -129,7 +141,7 @@ export const run = async (settings: PluginSettings) => {
   }
 };
 
-// ZIP path: exportAsync for assets, stream files to UI; reuse cached preview HTML when selection unchanged.
+// ZIP path: exportAsync for assets, AI CSS class refactor, stream files to UI.
 export const exportZipPackage = async (settings: PluginSettings) => {
   postBackendMessage({ type: "zipStart" });
 
@@ -138,6 +150,16 @@ export const exportZipPackage = async (settings: PluginSettings) => {
     postBackendMessage({
       type: "zipError",
       error: "Select a frame before downloading the ZIP",
+    });
+    return;
+  }
+
+  const apiKey = await getOpenRouterApiKey();
+  if (!apiKey) {
+    postBackendMessage({
+      type: "zipError",
+      error:
+        "Add your OpenRouter API key in About before downloading ZIP (needed to organize CSS into classes)",
     });
     return;
   }
@@ -151,30 +173,104 @@ export const exportZipPackage = async (settings: PluginSettings) => {
     postBackendMessage({
       type: "progress",
       message: "Building index.html…",
-      percent: 88,
+      percent: 72,
     });
 
     // Always rebuild. A cached preview can still be HTML text for a face that
     // this download just outlined to SVG (Electroharmonix).
     let html: string | null = null;
+    let css = "";
+    let stylesheetPath = ZIP_STYLESHEET_PATH;
     const converted = await convertSelection(
       effectiveSettings,
       settings.useOldPluginVersion2025,
     );
     if (converted) {
-      html = await buildZipIndexHtml(
+      postBackendMessage({
+        type: "progress",
+        message: "Exporting SVG assets for import…",
+        percent: 78,
+      });
+      const ensured = await ensureFlattenedSvgAssets(
+        converted.convertedSelection,
+      );
+      applyAssetFlagsToTree(converted.convertedSelection);
+      if (ensured.added > 0) {
+        postBackendMessage({
+          type: "progress",
+          message: `Added ${ensured.added} SVG asset file(s)…`,
+          percent: 80,
+        });
+      }
+
+      const bundle = await buildZipIndexHtml(
         converted.convertedSelection,
         effectiveSettings,
         selection[0]?.name || "export",
       );
-      lastPreview = { rootId, html };
+      html = bundle.html;
+      css = bundle.css;
+      stylesheetPath = bundle.stylesheetPath;
     }
 
     if (html) {
       postBackendMessage({
+        type: "progress",
+        message: "Extracting CSS into styles/page.css…",
+        percent: 82,
+      });
+      const extracted = extractInlineStylesToClasses(html, css);
+      html = extracted.html;
+      css = extracted.css;
+
+      postBackendMessage({
+        type: "progress",
+        message:
+          extracted.classCount > 0
+            ? `AI classifying ${extracted.classCount} CSS classes…`
+            : "AI reviewing CSS classes…",
+        percent: 90,
+      });
+      try {
+        const ai = await callOpenRouterCssRefactor({ apiKey, html, css });
+        const renameCount = Object.keys(ai.renames || {}).length;
+        const renamed = applyClassRenames(html, css, ai.renames);
+        html = renamed.html;
+        css = renamed.css;
+        postBackendMessage({
+          type: "progress",
+          message:
+            renameCount > 0
+              ? `AI renamed ${renameCount} classes — packaging ZIP…`
+              : "AI CSS pass done — packaging ZIP…",
+          percent: 96,
+        });
+      } catch (e) {
+        // Keep deterministic class extraction if the rename call fails.
+        const msg =
+          e instanceof OpenRouterHttpError
+            ? e.message
+            : e && typeof e === "object" && "message" in e
+              ? String((e as Error).message)
+              : String(e || "OpenRouter CSS refactor failed");
+        logError("CSS class rename skipped", e);
+        postBackendMessage({
+          type: "progress",
+          message: `AI rename skipped — using generated classes (${msg.slice(0, 80)})`,
+          percent: 92,
+        });
+      }
+
+      lastPreview = { rootId, html };
+      postBackendMessage({
         type: "zipFile",
         path: "index.html",
         bytes: utf8Encode(html),
+      });
+      postBackendMessage({
+        type: "zipFile",
+        path: stylesheetPath,
+        bytes: utf8Encode(css.endsWith("\n") ? css : `${css}\n`),
       });
     }
 

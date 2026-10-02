@@ -3,6 +3,8 @@
 import type { LayerInventoryItem } from "./inventory";
 
 export const OPENROUTER_MODEL = "xiaomi/mimo-v2.5";
+/** Code editing / CSS refactor — matches verified-agent `openRouter.models.codegen`. */
+export const OPENROUTER_CODE_MODEL = "anthropic/claude-sonnet-4";
 export const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 /** USD per 1M tokens for cost estimates logged after each vision call. */

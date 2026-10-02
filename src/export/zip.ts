@@ -4,7 +4,13 @@
  * and streams each file to the UI via zipFile messages.
  */
 import { ZipFileMessage } from "types";
-import { CachedAsset, clearAssetCache, setAssetCache } from "./cache";
+import {
+  CachedAsset,
+  clearAssetCache,
+  setAssetCache,
+  upsertCachedAsset,
+  getCachedAsset,
+} from "./cache";
 import { postBackendMessage } from "../messaging";
 import { EXPORT_TIMEOUT_MS, withTimeout } from "../convert/media/exportAsync";
 import { logError, safeNodeRef } from "../shared/log";
@@ -686,6 +692,90 @@ function postZipFile(path: string, bytes: Uint8Array): void {
     path,
     bytes,
   } as ZipFileMessage);
+}
+
+function nodeNeedsSvgAsset(n: any): boolean {
+  if (!n || typeof n !== "object") return false;
+  if (n.visible === false) return false;
+  const t = String(n.type || "");
+  if (n.canBeFlattened || n.assetOnly) return true;
+  return (
+    t === "VECTOR" ||
+    t === "BOOLEAN_OPERATION" ||
+    t === "STAR" ||
+    t === "LINE" ||
+    t === "POLYGON" ||
+    t === "REGULAR_POLYGON"
+  );
+}
+
+/**
+ * After nodesToJSON, export any flattenable SVG that collectExportTargets missed
+ * so index.html can reference assets/*.svg instead of inlining markup.
+ */
+export async function ensureFlattenedSvgAssets(
+  convertedNodes: readonly any[],
+): Promise<{ added: number; failed: number }> {
+  let added = 0;
+  let failed = 0;
+  const seen = new Set<string>();
+
+  const walk = async (n: any): Promise<void> => {
+    if (!n || typeof n !== "object") return;
+    const id = typeof n.id === "string" ? n.id : "";
+    if (id && nodeNeedsSvgAsset(n) && !seen.has(id)) {
+      seen.add(id);
+      if (!getCachedAsset(id)) {
+        let scene: SceneNode | null = null;
+        try {
+          scene = (await figma.getNodeByIdAsync(id)) as SceneNode | null;
+        } catch (e) {
+          logError(`getNodeByIdAsync failed for ${id}`, e);
+          failed += 1;
+        }
+        if (scene && "exportAsync" in scene && scene.visible !== false) {
+          try {
+            const result = await exportNodeBytes(scene, "SVG");
+            const actual: ExportFormat =
+              result.format === "SVG" ? "SVG" : "PNG";
+            let bytes = result.bytes;
+            if (actual === "SVG") {
+              try {
+                bytes = utf8Encode(
+                  fixSvgLinearGradients(utf8Decode(result.bytes), scene),
+                );
+              } catch (e) {
+                logError(`SVG gradient fix failed (${safeNodeRef(scene)})`, e);
+              }
+            }
+            const rel = assetRelPath(scene, actual);
+            postZipFile(rel, bytes);
+            upsertCachedAsset(id, pathOnlyAsset(scene, actual, rel));
+            n.assetOnly = true;
+            n.canBeFlattened = true;
+            n.exportAsAsset = true;
+            added += 1;
+          } catch (e) {
+            logError(`ensure SVG asset failed (${safeNodeRef(scene)})`, e);
+            failed += 1;
+          }
+        }
+      } else {
+        n.assetOnly = true;
+        if (getCachedAsset(id)?.format === "SVG") {
+          n.canBeFlattened = true;
+        }
+      }
+    }
+    // Do not walk children of a node that will be emitted as a single SVG asset.
+    if (n.canBeFlattened || n.assetOnly) return;
+    if (Array.isArray(n.children)) {
+      for (const c of n.children) await walk(c);
+    }
+  };
+
+  for (const n of convertedNodes) await walk(n);
+  return { added, failed };
 }
 
 /** Export assets, stream each file to the UI, then retain path + flags in cache. */

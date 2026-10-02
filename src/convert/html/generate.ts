@@ -133,13 +133,15 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
       nodeType === "ELLIPSE")
   ) {
     (node as any).canBeFlattened = true;
-    // Static ZIP: <img src="assets/..."> instead of inlined SVG markup.
+    // Static ZIP / relative paths: always <img src="assets/..."> — never inline SVG.
     if (settings.relativeAssetPaths && cachedSvg.path) {
       return htmlWrapSVGFile(node, settings, cachedSvg.path);
     }
-    const altNode = await renderAndAttachSVG(node);
-    if (altNode.svg) {
-      return htmlWrapSVG(altNode, settings);
+    if (!settings.relativeAssetPaths) {
+      const altNode = await renderAndAttachSVG(node);
+      if (altNode.svg) {
+        return htmlWrapSVG(altNode, settings);
+      }
     }
   }
 
@@ -147,10 +149,33 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
     if (settings.relativeAssetPaths && cachedSvg?.path) {
       return htmlWrapSVGFile(node, settings, cachedSvg.path);
     }
+    if (settings.relativeAssetPaths) {
+      addWarning(
+        `Missing SVG asset for “${node.name || node.id}” (could not write assets/*.svg; layer skipped)`,
+      );
+      return "";
+    }
     const altNode = await renderAndAttachSVG(node);
     if (altNode.svg) {
       return htmlWrapSVG(altNode, settings);
     }
+  }
+
+  // Vector primitives with relative asset paths must use files, not empty CSS boxes.
+  if (
+    settings.relativeAssetPaths &&
+    settings.embedVectors &&
+    (nodeType === "VECTOR" ||
+      nodeType === "BOOLEAN_OPERATION" ||
+      nodeType === "STAR" ||
+      nodeType === "POLYGON" ||
+      nodeType === "REGULAR_POLYGON")
+  ) {
+    if (cachedSvg?.path) {
+      return htmlWrapSVGFile(node, settings, cachedSvg.path);
+    }
+    addWarning(`Missing SVG asset for ${node.name || node.id}`);
+    return "";
   }
 
   switch ((node as any).type) {

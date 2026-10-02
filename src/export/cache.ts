@@ -33,6 +33,10 @@ export function getCachedAsset(nodeId: string): CachedAsset | undefined {
   return cacheByNodeId.get(nodeId);
 }
 
+export function upsertCachedAsset(nodeId: string, asset: CachedAsset): void {
+  cacheByNodeId.set(nodeId, asset);
+}
+
 export function getAllCachedAssets(): ReadonlyMap<string, CachedAsset> {
   return cacheByNodeId;
 }

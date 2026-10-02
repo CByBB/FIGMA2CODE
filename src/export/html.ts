@@ -1,11 +1,13 @@
 /**
- * Builds standalone index.html for ZIP downloads using relative assets/* paths
- * instead of inline data URLs used in the live preview.
+ * Builds standalone index.html + styles/page.css for ZIP downloads using
+ * relative assets/* paths instead of inline data URLs used in the live preview.
  */
 import { PluginSettings } from "types";
 import { lockedHtmlSettings } from "../convert/settings";
 import { htmlMain } from "../convert/html/generate";
 import { googleFontsHeadHtml } from "./googleFonts";
+
+export const ZIP_STYLESHEET_PATH = "styles/page.css";
 
 function escapeHtml(text: string): string {
   return String(text || "")
@@ -40,19 +42,19 @@ function designWidthPx(nodes: SceneNode[]): number | null {
  */
 function artboardShellCss(designWidth: number | null): string {
   const w = designWidth && designWidth > 0 ? designWidth : null;
-  return `    html, body { margin: 0; padding: 0; }
-    body { background: #fff; }
-    #artboard-stage {
-      width: 100%;
-      display: flex;
-      justify-content: center;
-      overflow-x: clip;
-    }
-    #artboard {
-      ${w ? `width: ${w}px;` : ""}
-      flex-shrink: 0;
-      transform-origin: top center;
-    }
+  return `html, body { margin: 0; padding: 0; }
+body { background: #fff; }
+#artboard-stage {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  overflow-x: clip;
+}
+#artboard {
+  ${w ? `width: ${w}px;` : ""}
+  flex-shrink: 0;
+  transform-origin: top center;
+}
 `;
 }
 
@@ -79,28 +81,34 @@ function artboardShellScript(designWidth: number | null): string {
 </script>`;
 }
 
-/** Emit index.html + embedded CSS for the extracted ZIP folder. */
+export type ZipHtmlBundle = {
+  html: string;
+  css: string;
+  stylesheetPath: string;
+};
+
+/** Emit index.html + separate styles/page.css for the ZIP folder. */
 export async function buildZipIndexHtml(
   nodes: SceneNode[],
   settings: PluginSettings,
   title: string,
-): Promise<string> {
+): Promise<ZipHtmlBundle> {
   const output = await htmlMain(nodes, lockedHtmlSettings(settings), false);
 
   const body = rewriteDataUrlsToRelativePaths(output.html);
-  const css = output.css ? `\n${output.css}\n` : "";
   const safeTitle = escapeHtml(title || "Figma export");
   const fontLinks = googleFontsHeadHtml(nodes);
   const designWidth = designWidthPx(nodes);
+  const cssParts = [artboardShellCss(designWidth)];
+  if (output.css?.trim()) cssParts.push(output.css.trim());
 
-  return `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${safeTitle}</title>
-${fontLinks}  <style>
-${artboardShellCss(designWidth)}${css}  </style>
+${fontLinks}  <link rel="stylesheet" href="${ZIP_STYLESHEET_PATH}" />
 </head>
 <body>
 <div id="artboard-stage">
@@ -112,4 +120,10 @@ ${artboardShellScript(designWidth)}
 </body>
 </html>
 `;
+
+  return {
+    html,
+    css: cssParts.join("\n"),
+    stylesheetPath: ZIP_STYLESHEET_PATH,
+  };
 }

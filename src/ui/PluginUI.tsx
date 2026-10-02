@@ -1,4 +1,6 @@
-/** Main plugin panel layout: code preview, palettes, warnings, and About settings. */
+/**
+ * Main plugin panel: actions, honest progress, Code/JSON preview, palettes, About.
+ */
 import copy from "copy-to-clipboard";
 import GradientsPanel from "./components/GradientsPanel";
 import ColorsPanel from "./components/ColorsPanel";
@@ -13,8 +15,8 @@ import {
   Warning,
 } from "types";
 import Loading from "./components/Loading";
-import { useEffect, useState } from "react";
-import { InfoIcon } from "lucide-react";
+import { useState } from "react";
+import { Download, InfoIcon, Ruler, Sparkles } from "lucide-react";
 import React from "react";
 import { Button } from "./primitives/button";
 import { ScrollArea } from "./primitives/scroll-area";
@@ -54,244 +56,284 @@ type PluginUIProps = {
   onShowMore?: () => void;
 };
 
-const LOADING_INDICATOR_DELAY_MS = 250;
-
-const ZipToolbar = ({
-  statusMessage,
-  progressPercent,
+function StatusPill({
   isLoading,
-  isZipExporting,
   isTidying,
-  hasOpenRouterKey,
-  canDownloadZip,
-  onDownloadZip,
-  onExportBounds,
-  onTidyAndConvert,
+  isZipExporting,
+  isError,
+  hasCode,
+  isEmpty,
 }: {
-  statusMessage?: string;
-  progressPercent?: number | null;
   isLoading: boolean;
-  isZipExporting: boolean;
   isTidying: boolean;
-  hasOpenRouterKey: boolean;
-  canDownloadZip: boolean;
-  onDownloadZip?: () => void;
-  onExportBounds?: () => void;
-  onTidyAndConvert?: () => void;
-}) => {
-  const busy = isLoading || isZipExporting || isTidying;
-  const hasPercent =
-    typeof progressPercent === "number" &&
-    progressPercent >= 0 &&
-    Number.isFinite(progressPercent);
-
-  return (
-    <div className="w-full flex flex-col gap-2">
-      <div className="w-full flex items-center justify-between gap-2">
-        <p className="text-xs text-muted-foreground min-w-0 wrap-break-word">
-          {statusMessage ||
-            (canDownloadZip
-              ? "Download ZIP for index.html + assets"
-              : hasOpenRouterKey
-                ? "Select a frame, or Tidy + Convert for the page"
-                : "Add OpenRouter API key in About to enable Tidy + Convert")}
-        </p>
-        <div className="flex shrink-0 items-center gap-1.5">
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8"
-            disabled={busy || !onTidyAndConvert || !hasOpenRouterKey}
-            title={
-              hasOpenRouterKey
-                ? "Clone, AI-section, Auto Layout, then convert"
-                : "Save an OpenRouter API key in About first"
-            }
-            onClick={() => onTidyAndConvert?.()}
-          >
-            {isTidying ? "Tidying…" : "Tidy + Convert"}
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8"
-            disabled={busy || !onExportBounds}
-            title="Export Measure bounds.json (frame-top-left, Plugin API)"
-            onClick={() => onExportBounds?.()}
-          >
-            Export bounds
-          </Button>
-          <Button
-            size="sm"
-            className="h-8"
-            disabled={!canDownloadZip || busy || !onDownloadZip}
-            onClick={() => onDownloadZip?.()}
-          >
-            {isZipExporting ? "Exporting…" : "Download ZIP"}
-          </Button>
-        </div>
+  isZipExporting: boolean;
+  isError: boolean;
+  hasCode: boolean;
+  isEmpty: boolean;
+}) {
+  if (isError) {
+    return (
+      <div className="va-pill bad" title="Error">
+        <span className="dot" aria-hidden="true" />
+        <span>Error</span>
       </div>
-      {isZipExporting && (
-        <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
-          <div
-            className={`h-full rounded-full bg-primary transition-[width] duration-200 ease-out ${
-              hasPercent ? "" : "w-1/3 animate-pulse"
-            }`}
-            style={
-              hasPercent
-                ? {
-                    width: `${Math.max(0, Math.min(100, progressPercent!))}%`,
-                  }
-                : undefined
-            }
-          />
-        </div>
-      )}
+    );
+  }
+  if (isLoading || isTidying) {
+    return (
+      <div className="va-pill busy" title="Working">
+        <span className="dot" aria-hidden="true" />
+        <span>{isTidying ? "Tidying" : "Working"}</span>
+      </div>
+    );
+  }
+  if (isZipExporting) {
+    return (
+      <div className="va-pill busy" title="Exporting ZIP">
+        <span className="dot" aria-hidden="true" />
+        <span>Exporting</span>
+      </div>
+    );
+  }
+  if (hasCode) {
+    return (
+      <div className="va-pill ok" title="Ready">
+        <span className="dot" aria-hidden="true" />
+        <span>Ready</span>
+      </div>
+    );
+  }
+  return (
+    <div className="va-pill" title={isEmpty ? "Idle" : "Idle"}>
+      <span className="dot" aria-hidden="true" />
+      <span>Idle</span>
     </div>
   );
-};
+}
 
 export const PluginUI = (props: PluginUIProps) => {
   const [showAbout, setShowAbout] = useState(false);
-  const [hasBeenIdle, setHasBeenIdle] = useState(!props.isLoading);
-  const [delayElapsed, setDelayElapsed] = useState(false);
 
-  if (!props.isLoading && !hasBeenIdle) {
-    setHasBeenIdle(true);
-  }
-  if (!props.isLoading && delayElapsed) {
-    setDelayElapsed(false);
-  }
-
-  useEffect(() => {
-    if (!props.isLoading || hasBeenIdle) {
-      return;
-    }
-
-    const timer = window.setTimeout(() => {
-      setDelayElapsed(true);
-    }, LOADING_INDICATOR_DELAY_MS);
-
-    return () => window.clearTimeout(timer);
-  }, [props.isLoading, hasBeenIdle]);
-
+  const busy =
+    props.isLoading ||
+    Boolean(props.isZipExporting) ||
+    Boolean(props.isTidying);
   const isEmpty = !props.isLoading && props.code === "";
+  const isError = Boolean(props.code?.startsWith("Error :("));
   const warnings = props.warnings ?? [];
-  const showBodyLoading = props.isLoading && (hasBeenIdle || delayElapsed);
-  const canDownloadZip =
-    props.code !== "" && !props.code.startsWith("Error :(");
+  const canDownloadZip = props.code !== "" && !isError && !busy;
+  const hasKey = Boolean(props.hasOpenRouterKey);
+  const hasPercent =
+    typeof props.progressPercent === "number" &&
+    props.progressPercent >= 0 &&
+    Number.isFinite(props.progressPercent);
+  const showInlineProgress =
+    props.isZipExporting || (props.isLoading && hasPercent);
+  /** Convert/tidy: full progress panel. ZIP: keep preview, bar in header. */
+  const showProgressPanel =
+    Boolean(props.isLoading) && !Boolean(props.isZipExporting);
 
   return (
     <TooltipProvider>
-      <div className="flex flex-col h-full overflow-hidden bg-background text-foreground">
-        <div className="px-2 py-1.5 dark:bg-card">
-          <div className="flex gap-1 bg-muted dark:bg-card rounded-lg p-0.5">
-            <p className="flex grow items-center px-2 text-sm font-medium text-foreground">
-              HTML
-            </p>
-            <Button
-              variant="ghost"
-              size="icon"
-              className={`h-8 w-8 rounded-md ${
-                showAbout
-                  ? "bg-primary text-primary-foreground shadow-xs hover:bg-primary hover:text-primary-foreground dark:hover:bg-primary"
-                  : "bg-muted text-foreground hover:bg-primary/90 hover:text-primary-foreground dark:hover:bg-primary/90"
-              }`}
-              onClick={() => {
-                setShowAbout(!showAbout);
-              }}
-              aria-label="About"
-            >
-              <InfoIcon size={16} />
-            </Button>
+      <div className="flex h-full flex-col overflow-hidden bg-background text-foreground">
+        <header className="shrink-0 border-b border-border px-4 pb-3 pt-3.5">
+          <div className="flex items-start justify-between gap-2.5">
+            <div className="min-w-0">
+              <h1 className="m-0 text-[15px] font-bold tracking-tight">
+                Figma to Code
+              </h1>
+              <p className="mt-1 mb-0 text-[11px] leading-[1.4] text-muted-foreground">
+                Preview HTML · ZIP with styles/page.css + assets
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <StatusPill
+                isLoading={Boolean(props.isLoading)}
+                isTidying={Boolean(props.isTidying)}
+                isZipExporting={Boolean(props.isZipExporting)}
+                isError={isError}
+                isEmpty={isEmpty}
+                hasCode={canDownloadZip}
+              />
+              <Button
+                variant="ghost"
+                size="icon"
+                className={`h-8 w-8 rounded-lg ${
+                  showAbout
+                    ? "bg-primary text-primary-foreground hover:bg-primary hover:text-primary-foreground"
+                    : ""
+                }`}
+                onClick={() => setShowAbout(!showAbout)}
+                aria-label="About"
+              >
+                <InfoIcon size={16} />
+              </Button>
+            </div>
           </div>
-        </div>
-        <div
-          style={{
-            height: 1,
-            width: "100%",
-            backgroundColor: "rgba(255,255,255,0.12)",
-          }}
-        ></div>
+        </header>
+
+        {!showAbout && (
+          <div className="shrink-0 border-b border-border px-4 py-3">
+            <div className="va-now mb-2.5">
+              {props.statusMessage ||
+                (canDownloadZip
+                  ? "Preview ready — Download ZIP to package files"
+                  : hasKey
+                    ? "Select a frame to generate a preview"
+                    : "Add an OpenRouter key in About for Tidy / ZIP CSS organize")}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                className="h-8 min-w-28 flex-1"
+                disabled={!canDownloadZip || !props.onDownloadZip || !hasKey}
+                title={
+                  hasKey
+                    ? "Build ZIP: AI-named classes in styles/page.css + index.html + assets"
+                    : "Save an OpenRouter API key in About first (needed for AI CSS classifying)"
+                }
+                onClick={() => props.onDownloadZip?.()}
+              >
+                <Download size={14} />
+                {props.isZipExporting ? "Exporting…" : "Download ZIP"}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8"
+                disabled={busy || !props.onTidyAndConvert || !hasKey}
+                title={
+                  hasKey
+                    ? "Clone, AI-section, Auto Layout, then convert"
+                    : "Save an OpenRouter API key in About first"
+                }
+                onClick={() => props.onTidyAndConvert?.()}
+              >
+                <Sparkles size={14} />
+                {props.isTidying ? "Tidying…" : "Tidy"}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8"
+                disabled={busy || !props.onExportBounds}
+                title="Export Measure bounds.json"
+                onClick={() => props.onExportBounds?.()}
+              >
+                <Ruler size={14} />
+                Bounds
+              </Button>
+            </div>
+            {showInlineProgress && (
+              <div className="mt-2.5 h-1 w-full overflow-hidden rounded-full bg-muted">
+                <div
+                  className={`h-full rounded-full bg-primary transition-[width] duration-200 ease-out ${
+                    hasPercent ? "" : "w-1/3 animate-pulse"
+                  }`}
+                  style={
+                    hasPercent
+                      ? {
+                          width: `${Math.max(0, Math.min(100, props.progressPercent!))}%`,
+                        }
+                      : undefined
+                  }
+                />
+              </div>
+            )}
+          </div>
+        )}
+
         <ScrollArea className="min-h-0 flex-1 overflow-hidden">
           {showAbout ? (
             <About
               useOldPluginVersion={props.settings?.useOldPluginVersion2025}
-              hasOpenRouterKey={Boolean(props.hasOpenRouterKey)}
+              hasOpenRouterKey={hasKey}
               onPreferenceChanged={props.onPreferenceChanged}
               onSaveOpenRouterKey={props.onSaveOpenRouterKey}
               onClearOpenRouterKey={props.onClearOpenRouterKey}
             />
           ) : (
-            <div className="flex flex-col items-center px-4 pt-3 pb-2 gap-2 dark:bg-transparent min-h-full">
-              <ZipToolbar
-                statusMessage={props.statusMessage}
-                progressPercent={props.progressPercent}
-                isLoading={props.isLoading}
-                isZipExporting={Boolean(props.isZipExporting)}
-                isTidying={Boolean(props.isTidying)}
-                hasOpenRouterKey={Boolean(props.hasOpenRouterKey)}
-                canDownloadZip={canDownloadZip}
-                onDownloadZip={props.onDownloadZip}
-                onExportBounds={props.onExportBounds}
-                onTidyAndConvert={props.onTidyAndConvert}
-              />
-
-              {showBodyLoading ? (
-                <div className="flex flex-1 w-full items-center justify-center py-6">
-                  <Loading
-                    statusMessage={props.statusMessage}
-                    progressPercent={props.progressPercent}
-                  />
-                </div>
+            <div className="flex min-h-full flex-col gap-3 px-4 py-3">
+              {showProgressPanel ? (
+                <section>
+                  <h2 className="va-section-title">Progress</h2>
+                  <div className="va-panel">
+                    <Loading
+                      statusMessage={props.statusMessage}
+                      progressPercent={props.progressPercent}
+                    />
+                  </div>
+                </section>
               ) : isEmpty ? (
-                <div className="flex flex-1 w-full items-center justify-center">
-                  <EmptyState />
-                </div>
+                <section>
+                  <h2 className="va-section-title">Preview</h2>
+                  <div className="va-panel">
+                    <EmptyState />
+                  </div>
+                </section>
               ) : (
                 <>
-                  {warnings.length > 0 && <WarningsPanel warnings={warnings} />}
+                  {warnings.length > 0 && (
+                    <section>
+                      <h2 className="va-section-title">Warnings</h2>
+                      <WarningsPanel warnings={warnings} />
+                    </section>
+                  )}
 
-                  <CodePanel
-                    code={props.code}
-                    lineCount={props.lineCount}
-                    showingFullCode={props.showingFullCode}
-                    previewMode={props.previewMode}
-                    figmaJson={props.figmaJson}
-                    jsonLineCount={props.jsonLineCount}
-                    showingFullJson={props.showingFullJson}
-                    figmaJsonLoading={props.figmaJsonLoading}
-                    onPreviewModeChange={props.onPreviewModeChange}
-                    onCopy={props.onCopy}
-                    onShowMore={props.onShowMore}
-                  />
+                  <section>
+                    <h2 className="va-section-title">Preview</h2>
+                    <div className="va-panel">
+                      <CodePanel
+                        code={props.code}
+                        lineCount={props.lineCount}
+                        showingFullCode={props.showingFullCode}
+                        previewMode={props.previewMode}
+                        figmaJson={props.figmaJson}
+                        jsonLineCount={props.jsonLineCount}
+                        showingFullJson={props.showingFullJson}
+                        figmaJsonLoading={props.figmaJsonLoading}
+                        onPreviewModeChange={props.onPreviewModeChange}
+                        onCopy={props.onCopy}
+                        onShowMore={props.onShowMore}
+                      />
+                    </div>
+                  </section>
 
                   {props.colors.length > 0 && (
-                    <div className="mt-3 w-full">
+                    <section>
+                      <h2 className="va-section-title">Colors</h2>
                       <ColorsPanel
                         colors={props.colors}
                         onColorClick={(value) => {
                           copy(value);
                         }}
                       />
-                    </div>
+                    </section>
                   )}
 
                   {props.gradients.length > 0 && (
-                    <div className="mt-3 w-full">
+                    <section>
+                      <h2 className="va-section-title">Gradients</h2>
                       <GradientsPanel
                         gradients={props.gradients}
                         onColorClick={(value) => {
                           copy(value);
                         }}
                       />
-                    </div>
+                    </section>
                   )}
                 </>
               )}
             </div>
           )}
         </ScrollArea>
+
+        <footer className="flex shrink-0 items-center justify-between gap-2 border-t border-border px-4 py-2.5">
+          <div className="text-[10px] leading-[1.35] text-muted-foreground">
+            {hasKey ? "OpenRouter key saved" : "No OpenRouter key"} · ZIP runs
+            AI CSS classifying → styles/page.css + assets/
+          </div>
+        </footer>
       </div>
     </TooltipProvider>
   );

@@ -14,9 +14,7 @@ import {
   ToggleRight,
 } from "lucide-react";
 import { PluginSettings } from "types";
-import { Button, buttonVariants } from "../primitives/button";
-import { Card, CardContent } from "../primitives/card";
-import { cn } from "../lib/utils";
+import { Button } from "../primitives/button";
 import { logError } from "../../shared/log";
 
 type AboutProps = {
@@ -67,23 +65,20 @@ const About = ({
   };
 
   return (
-    <div className="flex flex-col p-5 gap-6 text-sm max-w-2xl mx-auto">
-      <div className="flex flex-col items-center text-center mb-2">
-        <div className="w-16 h-16 bg-linear-to-br from-green-400 to-emerald-600 rounded-xl flex items-center justify-center shadow-lg mb-3">
-          <Code size={32} className="text-white" />
-        </div>
-        <h2 className="text-2xl font-bold mb-1">Figma to Code</h2>
-        <div className="flex items-center gap-1 text-neutral-600 dark:text-neutral-300">
-          <span>Created with</span>
-          <Heart size={14} className="text-red-500 fill-red-500" />
-          <span>by Bernardo Ferrari</span>
-        </div>
-        <div className="mt-3 flex gap-3">
+    <div className="mx-auto flex max-w-2xl flex-col gap-3.5 px-4 py-3 text-sm">
+      <header className="mb-1">
+        <h2 className="m-0 text-[15px] font-bold tracking-tight">About</h2>
+        <p className="mt-1 mb-0 text-[11px] leading-[1.4] text-muted-foreground">
+          Created with{" "}
+          <Heart size={12} className="inline fill-red-500 text-red-500" /> by
+          Bernardo Ferrari
+        </p>
+        <div className="mt-2 flex gap-2">
           <a
             href="https://github.com/bernaferrari"
             target="_blank"
             rel="noopener noreferrer"
-            className="p-2 rounded-full bg-neutral-100 dark:bg-neutral-700 hover:bg-neutral-200 dark:hover:bg-neutral-600 transition-colors"
+            className="rounded-lg border border-border bg-muted p-1.5 transition-colors hover:bg-accent"
             aria-label="GitHub Profile"
           >
             <GithubLogo />
@@ -92,235 +87,210 @@ const About = ({
             href="https://twitter.com/bernaferrari"
             target="_blank"
             rel="noopener noreferrer"
-            className="p-2 rounded-full bg-neutral-100 dark:bg-neutral-700 hover:bg-neutral-200 dark:hover:bg-neutral-600 transition-colors"
+            className="rounded-lg border border-border bg-muted p-1.5 transition-colors hover:bg-accent"
             aria-label="Twitter Profile"
           >
             <XLogo />
           </a>
         </div>
-      </div>
+      </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Card className="border-neutral-200 py-0 transition-colors hover:border-green-300 dark:border-neutral-700 dark:hover:border-green-700">
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 bg-blue-100 dark:bg-blue-900/40 rounded-lg">
-                <Lock size={20} className="text-blue-600 dark:text-blue-400" />
-              </div>
-              <h3 className="font-semibold text-base">Privacy Policy</h3>
-            </div>
-            <p className="text-neutral-600 dark:text-neutral-300 leading-relaxed">
-              This plugin is completely private. All of your design data is
-              processed locally in your browser and never leaves your computer.
-              No analytics, no data collection, no tracking.
-            </p>
-          </CardContent>
-        </Card>
+      <section>
+        <h3 className="va-section-title">Privacy</h3>
+        <div className="va-panel">
+          <div className="mb-2 flex items-center gap-2">
+            <Lock size={16} className="text-primary" />
+            <span className="text-[13px] font-semibold">Privacy Policy</span>
+          </div>
+          <p className="m-0 text-[11px] leading-[1.45] text-muted-foreground">
+            This plugin is completely private. All of your design data is
+            processed locally in your browser and never leaves your computer. No
+            analytics, no data collection, no tracking.
+          </p>
+        </div>
+      </section>
 
-        <Card className="border-neutral-200 py-0 transition-colors hover:border-green-300 dark:border-neutral-700 dark:hover:border-green-700">
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 bg-purple-100 dark:bg-purple-900/40 rounded-lg">
-                <GithubLogo className="text-purple-600 dark:text-purple-400" />
-              </div>
-              <h3 className="font-semibold text-base">Open Source</h3>
-            </div>
-            <p className="text-neutral-600 dark:text-neutral-300 leading-relaxed mb-3">
-              Figma to Code is completely open-source. Contributions, bug
-              reports, and feature requests are welcome!
-            </p>
-            <a
-              href="https://github.com/CodeByStella/FIGMA2CODE"
-              target="_blank"
-              rel="noopener noreferrer"
-              className={cn(
-                buttonVariants({ variant: "ghost" }),
-                "w-fit bg-neutral-100 text-green-600 hover:bg-green-100 dark:bg-neutral-700 dark:text-green-400 dark:hover:bg-green-900/30",
-              )}
+      <section>
+        <h3 className="va-section-title">Open source</h3>
+        <div className="va-panel">
+          <p className="m-0 mb-2 text-[11px] leading-[1.45] text-muted-foreground">
+            Figma to Code is completely open-source. Contributions, bug reports,
+            and feature requests are welcome!
+          </p>
+          <a
+            href="https://github.com/CodeByStella/FIGMA2CODE"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-primary hover:underline"
+          >
+            <Star size={12} className="fill-amber-400 text-amber-400" />
+            View on GitHub
+          </a>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="va-section-title">Features</h3>
+        <div className="va-panel">
+          <ul className="m-0 space-y-1.5 p-0 text-[11px] leading-[1.45] text-muted-foreground">
+            <li className="flex items-start gap-2">
+              <ArrowRightIcon size={12} className="mt-0.5 shrink-0" />
+              <span>Convert Figma designs to HTML and CSS</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <ArrowRightIcon size={12} className="mt-0.5 shrink-0" />
+              <span>Extract colors and gradients from your designs</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <ArrowRightIcon size={12} className="mt-0.5 shrink-0" />
+              <span>Get responsive code that matches your design</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="va-section-title">Get in touch</h3>
+        <div className="va-panel">
+          <div className="mb-2 flex items-center gap-2">
+            <MessageCircle size={16} className="text-primary" />
+            <span className="text-[13px] font-semibold">Support</span>
+          </div>
+          <p className="m-0 mb-2 text-[11px] leading-[1.45] text-muted-foreground">
+            Have feedback, questions, or need help? Open a GitHub issue:
+          </p>
+          <a
+            href="https://github.com/CodeByStella/FIGMA2CODE/issues"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-primary hover:underline"
+          >
+            <GithubLogo width={14} height={14} />
+            Report an issue on GitHub
+          </a>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="va-section-title">Keys · OpenRouter</h3>
+        <div className="va-panel">
+          <div className="mb-2 flex items-center gap-2">
+            <Zap size={16} className="text-primary" />
+            <span className="text-[13px] font-semibold">Tidy + AI</span>
+          </div>
+          <p className="m-0 mb-2 text-[11px] leading-[1.45] text-muted-foreground">
+            Tidy + Convert uses vision{" "}
+            <code className="text-[10.5px]">xiaomi/mimo-v2.5</code>; Download
+            ZIP CSS refactor uses codegen{" "}
+            <code className="text-[10.5px]">anthropic/claude-sonnet-4</code>{" "}
+            (same as verified-agent). Your key is saved on this machine (Figma
+            client storage + a local backup) and is never logged in full. The
+            field stays empty after save for security — use Status below to
+            confirm it is still stored.
+          </p>
+          <div className="va-now mb-2">
+            Status:{" "}
+            {hasOpenRouterKey ? (
+              <strong className="text-(--ok)">
+                Key saved — survives plugin reload
+              </strong>
+            ) : (
+              <strong className="text-(--bad)">
+                No key — Tidy + Convert disabled
+              </strong>
+            )}
+          </div>
+          <label className="mb-1 block text-[11px] text-muted-foreground">
+            OpenRouter API key
+          </label>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <input
+              type="password"
+              autoComplete="off"
+              placeholder={
+                hasOpenRouterKey ? "Enter new key to replace…" : "sk-or-v1-…"
+              }
+              value={apiKeyDraft}
+              onChange={(e) => setApiKeyDraft(e.target.value)}
+              className="h-8 flex-1 rounded-lg border border-border bg-muted px-2.5 text-xs text-foreground outline-none focus:outline-2 focus:outline-primary/45"
+            />
+            <Button
+              size="sm"
+              className="h-8 shrink-0"
+              disabled={!apiKeyDraft.trim() || !onSaveOpenRouterKey}
+              onClick={saveApiKey}
             >
-              <Star size={14} className="text-yellow-500 fill-yellow-500" />
-              <span>View on GitHub</span>
-            </a>
-          </CardContent>
-        </Card>
-
-        <Card className="border-neutral-200 py-0 transition-colors hover:border-green-300 dark:border-neutral-700 dark:hover:border-green-700">
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 bg-amber-100 dark:bg-amber-900/40 rounded-lg">
-                <Zap size={20} className="text-amber-600 dark:text-amber-400" />
-              </div>
-              <h3 className="font-semibold text-base">Features</h3>
-            </div>
-            <ul className="text-neutral-600 dark:text-neutral-300 space-y-2 leading-relaxed">
-              <li className="flex items-start gap-2">
-                <div className="mt-1.5">
-                  <ArrowRightIcon size={12} />
-                </div>
-                <span>Convert Figma designs to HTML and CSS</span>
-              </li>
-              <li className="flex items-start gap-2">
-                <div className="mt-1.5">
-                  <ArrowRightIcon size={12} />
-                </div>
-                <span>Extract colors and gradients from your designs</span>
-              </li>
-              <li className="flex items-start gap-2">
-                <div className="mt-1.5">
-                  <ArrowRightIcon size={12} />
-                </div>
-                <span>Get responsive code that matches your design</span>
-              </li>
-            </ul>
-          </CardContent>
-        </Card>
-
-        <Card className="border-neutral-200 py-0 transition-colors hover:border-green-300 dark:border-neutral-700 dark:hover:border-green-700">
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 bg-green-100 dark:bg-green-900/40 rounded-lg">
-                <MessageCircle
-                  size={20}
-                  className="text-green-600 dark:text-green-400"
-                />
-              </div>
-              <h3 className="font-semibold text-base">Get in Touch</h3>
-            </div>
-            <p className="text-neutral-600 dark:text-neutral-300 leading-relaxed mb-3">
-              Have feedback, questions, or need help? Open a GitHub issue:
-            </p>
-            <div className="space-y-2">
-              <a
-                href="https://github.com/CodeByStella/FIGMA2CODE/issues"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 text-green-600 dark:text-green-400 hover:underline"
-              >
-                <GithubLogo width={16} height={16} />
-                <span>Report an issue on GitHub</span>
-              </a>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="border-neutral-200 py-0 transition-colors hover:border-green-300 dark:border-neutral-700 dark:hover:border-green-700 md:col-span-2">
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 bg-cyan-100 dark:bg-cyan-900/40 rounded-lg">
-                <Zap size={20} className="text-cyan-600 dark:text-cyan-400" />
-              </div>
-              <h3 className="font-semibold text-base">
-                OpenRouter (Tidy + AI)
-              </h3>
-            </div>
-            <p className="text-neutral-600 dark:text-neutral-300 leading-relaxed mb-3">
-              Tidy + Convert uses a vision model via OpenRouter (
-              <code className="text-xs">xiaomi/mimo-v2.5</code>). Your key is
-              saved on this machine (Figma client storage + a local backup) and
-              is never logged in full. The field stays empty after save for
-              security — use Status below to confirm it is still stored.
-            </p>
-            <p className="text-xs text-neutral-500 dark:text-neutral-400 mb-3">
-              Status:{" "}
-              {hasOpenRouterKey ? (
-                <span className="text-green-600 dark:text-green-400">
-                  Key saved — survives plugin reload
-                </span>
-              ) : (
-                <span className="text-amber-600 dark:text-amber-400">
-                  No key — Tidy + Convert disabled
-                </span>
-              )}
-            </p>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <input
-                type="password"
-                autoComplete="off"
-                placeholder={
-                  hasOpenRouterKey ? "Enter new key to replace…" : "sk-or-v1-…"
-                }
-                value={apiKeyDraft}
-                onChange={(e) => setApiKeyDraft(e.target.value)}
-                className="flex-1 h-8 rounded-md border border-neutral-200 dark:border-neutral-600 bg-background px-2 text-xs"
-              />
+              {keySavedFlash ? "Saved" : "Save key"}
+            </Button>
+            {hasOpenRouterKey && onClearOpenRouterKey ? (
               <Button
                 size="sm"
-                className="h-8 shrink-0"
-                disabled={!apiKeyDraft.trim() || !onSaveOpenRouterKey}
-                onClick={saveApiKey}
+                variant="outline"
+                className="h-8 shrink-0 text-(--bad) hover:bg-(--bad-bg)"
+                onClick={onClearOpenRouterKey}
               >
-                {keySavedFlash ? "Saved" : "Save key"}
+                Clear
               </Button>
-              {hasOpenRouterKey && onClearOpenRouterKey ? (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-8 shrink-0"
-                  onClick={onClearOpenRouterKey}
-                >
-                  Clear
-                </Button>
-              ) : null}
-            </div>
-          </CardContent>
-        </Card>
+            ) : null}
+          </div>
+        </div>
+      </section>
 
-        <Card className="border-neutral-200 py-0 transition-colors hover:border-green-300 dark:border-neutral-700 dark:hover:border-green-700">
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 bg-rose-100 dark:bg-rose-900/40 rounded-lg">
-                <Code size={20} className="text-rose-600 dark:text-rose-400" />
-              </div>
-              <h3 className="font-semibold text-base">Debug Helper</h3>
-            </div>
-            <p className="text-neutral-600 dark:text-neutral-300 leading-relaxed mb-4">
-              Having an issue? Help me debug by copying the JSON of your
-              selected elements. This can be attached when reporting issues.
-            </p>
-            <Button
-              onClick={copySelectionJson}
-              className="mb-3 bg-muted text-blue-600 hover:bg-blue-100 dark:text-blue-400 dark:hover:bg-blue-900/30"
+      <section>
+        <h3 className="va-section-title">Debug</h3>
+        <div className="va-panel">
+          <div className="mb-2 flex items-center gap-2">
+            <Code size={16} className="text-primary" />
+            <span className="text-[13px] font-semibold">Debug helper</span>
+          </div>
+          <p className="m-0 mb-3 text-[11px] leading-[1.45] text-muted-foreground">
+            Having an issue? Help debug by copying the JSON of your selected
+            elements. This can be attached when reporting issues.
+          </p>
+          <Button
+            onClick={copySelectionJson}
+            variant="outline"
+            size="sm"
+            className="mb-3 h-8"
+          >
+            {copied ? (
+              <>
+                <CheckCircle size={14} />
+                <span>Copied!</span>
+              </>
+            ) : (
+              <>
+                <Copy size={14} />
+                <span>Copy Selection JSON</span>
+              </>
+            )}
+          </Button>
+
+          <div className="mt-1 border-t border-border pt-3">
+            <button
+              type="button"
+              onClick={togglePluginVersion}
+              className="inline-flex w-full items-center gap-2 text-left text-[11px] text-muted-foreground transition-colors hover:text-foreground"
             >
-              {copied ? (
-                <>
-                  <CheckCircle size={16} />
-                  <span>Copied!</span>
-                </>
+              {useOldPluginVersion ? (
+                <ToggleRight size={16} className="text-(--ok)" />
               ) : (
-                <>
-                  <Copy size={16} />
-                  <span>Copy Selection JSON</span>
-                </>
+                <ToggleLeft size={16} />
               )}
-            </Button>
+              <span>Use previous plugin version</span>
+            </button>
+            <p className="mt-2 mb-0 text-[11px] leading-[1.4] text-muted-foreground">
+              The new version is up to 100x faster, but might still cause some
+              issues. If you encounter problems, you can switch to the old
+              version (and please report issues so they can be fixed).
+            </p>
+          </div>
+        </div>
+      </section>
 
-            <div className="mt-3 pt-3 border-t border-neutral-200 dark:border-neutral-700">
-              <button
-                onClick={togglePluginVersion}
-                className="inline-flex items-center gap-2 w-full text-left text-neutral-600 dark:text-neutral-400 text-xs hover:text-neutral-800 dark:hover:text-neutral-300 transition-colors"
-              >
-                {useOldPluginVersion ? (
-                  <ToggleRight size={16} className="text-green-500" />
-                ) : (
-                  <ToggleLeft size={16} />
-                )}
-                <span>Use previous plugin version</span>
-              </button>
-              <p className="mt-2 text-xs text-neutral-500 dark:text-neutral-400">
-                The new version is up to 100x faster, but might still cause some
-                issues. If you encounter problems, you can switch to the old
-                version (and please report issues so they can be fixed).
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="mt-2 text-center text-neutral-500 dark:text-neutral-400 text-xs">
-        <p>
-          © {new Date().getFullYear()} Bernardo Ferrari. All rights reserved.
-        </p>
-      </div>
+      <p className="mb-1 text-center text-[10px] text-muted-foreground">
+        © {new Date().getFullYear()} Bernardo Ferrari. All rights reserved.
+      </p>
     </div>
   );
 };
