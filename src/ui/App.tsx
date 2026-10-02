@@ -1,20 +1,17 @@
 /**
  * Plugin UI root: listens for main-thread postMessage events, assembles ZIP
- * downloads from streamed files, and forwards user actions (settings, export,
+ * downloads from streamed files, and forwards user actions (export,
  * tidy, OpenRouter key) back to plugin.ts.
  */
 import { useEffect, useRef, useState } from "react";
 import { PluginUI } from "./PluginUI";
 import { coerceIncomingBytes, downloadZipFromFiles } from "./zip";
-import { downloadJsonText } from "./downloadJson";
 import {
-  PluginSettings,
   ConversionMessage,
   Message,
   LinearGradientConversion,
   SolidColorConversion,
   ErrorMessage,
-  SettingsChangedMessage,
   Warning,
   ProgressMessage,
   ZipDoneMessage,
@@ -23,9 +20,7 @@ import {
   FullCodeMessage,
   OpenRouterKeyStatusMessage,
   SelectionJsonMessage,
-  BoundsExportMessage,
 } from "types";
-import { postUISettingsChangingMessage } from "./messaging";
 import copy from "copy-to-clipboard";
 import { logError } from "../shared/log";
 import type { PreviewMode } from "./components/CodePanel";
@@ -45,7 +40,6 @@ interface AppState {
   isZipExporting: boolean;
   isTidying: boolean;
   hasOpenRouterKey: boolean;
-  settings: PluginSettings | null;
   colors: SolidColorConversion[];
   gradients: LinearGradientConversion[];
   warnings: Warning[];
@@ -85,7 +79,6 @@ export default function App() {
     isZipExporting: false,
     isTidying: false,
     hasOpenRouterKey: false,
-    settings: null,
     colors: [],
     gradients: [],
     warnings: [],
@@ -254,11 +247,7 @@ export default function App() {
         }
 
         case "pluginSettingsChanged":
-          const settingsMessage = untypedMessage as SettingsChangedMessage;
-          setState((prevState) => ({
-            ...prevState,
-            settings: settingsMessage.settings,
-          }));
+          // Settings stay on the main thread; UI no longer edits conversion toggles.
           break;
 
         case "empty":
@@ -342,24 +331,6 @@ export default function App() {
           break;
         }
 
-        case "boundsExport": {
-          const boundsMsg = untypedMessage as BoundsExportMessage;
-          try {
-            downloadJsonText(boundsMsg.filename, boundsMsg.jsonText);
-            setState((prevState) => ({
-              ...prevState,
-              statusMessage: `Downloaded ${boundsMsg.filename} (${boundsMsg.nodeCount} nodes)`,
-            }));
-          } catch (e) {
-            logError("bounds.json browser download failed", e);
-            setState((prevState) => ({
-              ...prevState,
-              statusMessage: "Bounds export built but browser download failed",
-            }));
-          }
-          break;
-        }
-
         case "openRouterKeyStatus": {
           const status = untypedMessage as OpenRouterKeyStatusMessage;
           const hasKey = Boolean(status.hasKey);
@@ -396,16 +367,6 @@ export default function App() {
     parent.postMessage({ pluginMessage: { type: "ui-ready" } }, "*");
   }, []);
 
-  const handlePreferencesChange = (
-    key: keyof PluginSettings,
-    value: PluginSettings[keyof PluginSettings],
-  ) => {
-    if (state.settings && state.settings[key] === value) {
-    } else {
-      postUISettingsChangingMessage(key, value, { targetOrigin: "*" });
-    }
-  };
-
   const handleDownloadZip = () => {
     if (state.isLoading || state.isZipExporting || state.isTidying) return;
     if (!state.hasOpenRouterKey) return;
@@ -419,11 +380,6 @@ export default function App() {
       progressPercent: null,
     }));
     parent.postMessage({ pluginMessage: { type: "exportZip" } }, "*");
-  };
-
-  const handleExportBounds = () => {
-    if (state.isLoading || state.isZipExporting || state.isTidying) return;
-    parent.postMessage({ pluginMessage: { type: "exportBounds" } }, "*");
   };
 
   const handleTidyAndConvert = () => {
@@ -538,14 +494,11 @@ export default function App() {
         lineCount={state.lineCount}
         showingFullCode={state.showingFullCode}
         warnings={state.warnings}
-        onPreferenceChanged={handlePreferencesChange}
-        settings={state.settings}
         colors={state.colors}
         gradients={state.gradients}
         statusMessage={state.statusMessage}
         progressPercent={state.progressPercent}
         onDownloadZip={handleDownloadZip}
-        onExportBounds={handleExportBounds}
         onTidyAndConvert={handleTidyAndConvert}
         onSaveOpenRouterKey={handleSaveOpenRouterKey}
         onClearOpenRouterKey={handleClearOpenRouterKey}

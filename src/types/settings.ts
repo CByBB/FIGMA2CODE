@@ -12,6 +12,5 @@ export interface HTMLSettings {
 }
 
 export interface PluginSettings extends HTMLSettings {
-  useOldPluginVersion2025: boolean;
   responsiveRoot: boolean;
 }

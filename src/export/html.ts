@@ -2,7 +2,7 @@
  * Builds standalone index.html + styles/page.css for ZIP downloads using
  * relative assets/* paths instead of inline data URLs used in the live preview.
  */
-import { PluginSettings } from "types";
+import { PluginSettings, RestAltNode } from "types";
 import { lockedHtmlSettings } from "../convert/settings";
 import { htmlMain } from "../convert/html/generate";
 import { googleFontsHeadHtml } from "./googleFonts";
@@ -22,11 +22,8 @@ export function rewriteDataUrlsToRelativePaths(html: string): string {
   return html;
 }
 
-function designWidthPx(nodes: SceneNode[]): number | null {
-  const root = nodes[0] as SceneNode & {
-    width?: number;
-    absoluteBoundingBox?: { width: number } | null;
-  };
+function designWidthPx(nodes: readonly RestAltNode[]): number | null {
+  const root = nodes[0];
   if (!root) return null;
   if (typeof root.width === "number" && root.width > 0) {
     return Math.round(root.width);
@@ -89,15 +86,21 @@ export type ZipHtmlBundle = {
 
 /** Emit index.html + separate styles/page.css for the ZIP folder. */
 export async function buildZipIndexHtml(
-  nodes: SceneNode[],
+  nodes: RestAltNode[],
   settings: PluginSettings,
   title: string,
 ): Promise<ZipHtmlBundle> {
-  const output = await htmlMain(nodes, lockedHtmlSettings(settings), false);
+  // HTML emitters still type against live SceneNode; convert nodes are REST-shaped.
+  const sceneNodes = nodes as unknown as SceneNode[];
+  const output = await htmlMain(
+    sceneNodes,
+    lockedHtmlSettings(settings),
+    false,
+  );
 
   const body = rewriteDataUrlsToRelativePaths(output.html);
   const safeTitle = escapeHtml(title || "Figma export");
-  const fontLinks = googleFontsHeadHtml(nodes);
+  const fontLinks = googleFontsHeadHtml(sceneNodes);
   const designWidth = designWidthPx(nodes);
   const cssParts = [artboardShellCss(designWidth)];
   if (output.css?.trim()) cssParts.push(output.css.trim());

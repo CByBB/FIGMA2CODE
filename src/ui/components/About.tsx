@@ -10,28 +10,18 @@ import {
   Zap,
   Copy,
   CheckCircle,
-  ToggleLeft,
-  ToggleRight,
 } from "lucide-react";
-import { PluginSettings } from "types";
 import { Button } from "../primitives/button";
 import { logError } from "../../shared/log";
 
 type AboutProps = {
-  useOldPluginVersion?: boolean;
   hasOpenRouterKey?: boolean;
-  onPreferenceChanged: (
-    key: keyof PluginSettings,
-    value: PluginSettings[keyof PluginSettings],
-  ) => void;
   onSaveOpenRouterKey?: (key: string) => void;
   onClearOpenRouterKey?: () => void;
 };
 
 const About = ({
-  useOldPluginVersion = false,
   hasOpenRouterKey = false,
-  onPreferenceChanged,
   onSaveOpenRouterKey,
   onClearOpenRouterKey,
 }: AboutProps) => {
@@ -51,10 +41,6 @@ const About = ({
     } catch (e) {
       logError("copy selection JSON failed", e);
     }
-  };
-
-  const togglePluginVersion = () => {
-    onPreferenceChanged("useOldPluginVersion2025", !useOldPluginVersion);
   };
 
   const saveApiKey = () => {
@@ -265,26 +251,6 @@ const About = ({
               </>
             )}
           </Button>
-
-          <div className="mt-1 border-t border-border pt-3">
-            <button
-              type="button"
-              onClick={togglePluginVersion}
-              className="inline-flex w-full items-center gap-2 text-left text-[11px] text-muted-foreground transition-colors hover:text-foreground"
-            >
-              {useOldPluginVersion ? (
-                <ToggleRight size={16} className="text-(--ok)" />
-              ) : (
-                <ToggleLeft size={16} />
-              )}
-              <span>Use previous plugin version</span>
-            </button>
-            <p className="mt-2 mb-0 text-[11px] leading-[1.4] text-muted-foreground">
-              The new version is up to 100x faster, but might still cause some
-              issues. If you encounter problems, you can switch to the old
-              version (and please report issues so they can be fixed).
-            </p>
-          </div>
         </div>
       </section>
 

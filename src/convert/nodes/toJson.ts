@@ -687,7 +687,7 @@ const processNodePair = async (
 export const nodesToJSON = async (
   nodes: ReadonlyArray<SceneNode>,
   settings: PluginSettings,
-): Promise<Node[]> => {
+): Promise<RestAltNode[]> => {
   nodeNameCounters.clear();
   const nodeResults = await Promise.all(
     nodes.map(async (node) => {
@@ -720,7 +720,7 @@ export const nodesToJSON = async (
     }),
   );
 
-  const result: Node[] = [];
+  const result: RestAltNode[] = [];
 
   for (let i = 0; i < nodes.length; i++) {
     const processedNode = await processNodePair(

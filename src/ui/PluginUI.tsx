@@ -8,15 +8,10 @@ import CodePanel from "./components/CodePanel";
 import EmptyState from "./components/EmptyState";
 import About from "./components/About";
 import WarningsPanel from "./components/WarningsPanel";
-import {
-  PluginSettings,
-  LinearGradientConversion,
-  SolidColorConversion,
-  Warning,
-} from "types";
+import { LinearGradientConversion, SolidColorConversion, Warning } from "types";
 import Loading from "./components/Loading";
 import { useState } from "react";
-import { Download, InfoIcon, Ruler, Sparkles } from "lucide-react";
+import { Download, InfoIcon, Sparkles } from "lucide-react";
 import React from "react";
 import { Button } from "./primitives/button";
 import { ScrollArea } from "./primitives/scroll-area";
@@ -28,11 +23,6 @@ type PluginUIProps = {
   lineCount: number;
   showingFullCode: boolean;
   warnings: Warning[];
-  settings: PluginSettings | null;
-  onPreferenceChanged: (
-    key: keyof PluginSettings,
-    value: PluginSettings[keyof PluginSettings],
-  ) => void;
   colors: SolidColorConversion[];
   gradients: LinearGradientConversion[];
   isLoading: boolean;
@@ -42,7 +32,6 @@ type PluginUIProps = {
   statusMessage?: string;
   progressPercent?: number | null;
   onDownloadZip?: () => void;
-  onExportBounds?: () => void;
   onTidyAndConvert?: () => void;
   onSaveOpenRouterKey?: (key: string) => void;
   onClearOpenRouterKey?: () => void;
@@ -212,17 +201,6 @@ export const PluginUI = (props: PluginUIProps) => {
                 <Sparkles size={14} />
                 {props.isTidying ? "Tidying…" : "Tidy"}
               </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8"
-                disabled={busy || !props.onExportBounds}
-                title="Export Measure bounds.json"
-                onClick={() => props.onExportBounds?.()}
-              >
-                <Ruler size={14} />
-                Bounds
-              </Button>
             </div>
             {showInlineProgress && (
               <div className="mt-2.5 h-1 w-full overflow-hidden rounded-full bg-muted">
@@ -246,9 +224,7 @@ export const PluginUI = (props: PluginUIProps) => {
         <ScrollArea className="min-h-0 flex-1 overflow-hidden">
           {showAbout ? (
             <About
-              useOldPluginVersion={props.settings?.useOldPluginVersion2025}
               hasOpenRouterKey={hasKey}
-              onPreferenceChanged={props.onPreferenceChanged}
               onSaveOpenRouterKey={props.onSaveOpenRouterKey}
               onClearOpenRouterKey={props.onClearOpenRouterKey}
             />

@@ -92,7 +92,7 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
     return "";
   }
 
-  // Prefer baked SVG from ZIP cache (gradient text, icon instances, effect-heavy
+  // Prefer baked SVG/PNG from ZIP cache (gradient text, icon instances, effect-heavy
   // vectors, and assetOnly RECTANGLE/ELLIPSE — e.g. Overlay+Shadow drop shadows).
   // Plugin API uses POLYGON; REST / enriched alt-nodes may still say REGULAR_POLYGON.
   const cachedSvg = node.id ? getCachedAsset(node.id) : undefined;
@@ -104,14 +104,16 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
     cachedSvg?.format === "PNG" &&
     cachedSvg.path &&
     settings.relativeAssetPaths &&
-    "children" in node &&
-    Array.isArray((node as SceneNode & ChildrenMixin).children) &&
-    (node as SceneNode & ChildrenMixin).children.length > 0 &&
-    (nodeType === "FRAME" ||
-      nodeType === "GROUP" ||
-      nodeType === "COMPONENT" ||
-      nodeType === "INSTANCE") &&
-    !("fills" in node && nodeHasImageFill(node))
+    ((node as any).canBeFlattened ||
+      (node as any).assetOnly ||
+      ("children" in node &&
+        Array.isArray((node as SceneNode & ChildrenMixin).children) &&
+        (node as SceneNode & ChildrenMixin).children.length > 0 &&
+        (nodeType === "FRAME" ||
+          nodeType === "GROUP" ||
+          nodeType === "COMPONENT" ||
+          nodeType === "INSTANCE") &&
+        !("fills" in node && nodeHasImageFill(node))))
   ) {
     return htmlWrapCompositePng(node, settings, cachedSvg.path);
   }
@@ -147,17 +149,21 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
 
   if (settings.embedVectors && (node as any).canBeFlattened) {
     if (settings.relativeAssetPaths && cachedSvg?.path) {
-      return htmlWrapSVGFile(node, settings, cachedSvg.path);
+      return cachedSvg.format === "PNG"
+        ? htmlWrapCompositePng(node, settings, cachedSvg.path)
+        : htmlWrapSVGFile(node, settings, cachedSvg.path);
     }
     if (settings.relativeAssetPaths) {
+      // Export missed this icon — fall through to children/CSS instead of dropping it.
       addWarning(
-        `Missing SVG asset for “${node.name || node.id}” (could not write assets/*.svg; layer skipped)`,
+        `Missing SVG asset for “${node.name || node.id}” (could not write assets/*.svg; rendering as HTML)`,
       );
-      return "";
-    }
-    const altNode = await renderAndAttachSVG(node);
-    if (altNode.svg) {
-      return htmlWrapSVG(altNode, settings);
+      (node as any).canBeFlattened = false;
+    } else {
+      const altNode = await renderAndAttachSVG(node);
+      if (altNode.svg) {
+        return htmlWrapSVG(altNode, settings);
+      }
     }
   }
 
@@ -172,9 +178,13 @@ const convertNode = (settings: HTMLSettings) => async (node: SceneNode) => {
       nodeType === "REGULAR_POLYGON")
   ) {
     if (cachedSvg?.path) {
-      return htmlWrapSVGFile(node, settings, cachedSvg.path);
+      return cachedSvg.format === "PNG"
+        ? htmlWrapCompositePng(node, settings, cachedSvg.path)
+        : htmlWrapSVGFile(node, settings, cachedSvg.path);
     }
-    addWarning(`Missing SVG asset for ${node.name || node.id}`);
+    addWarning(
+      `Missing SVG asset for “${node.name || node.id}” (could not write assets/*.svg; layer skipped)`,
+    );
     return "";
   }
 

@@ -21,6 +21,7 @@ import {
 } from "./googleFonts";
 import { commonLetterSpacing } from "../convert/layout/text";
 import { utf8Decode, utf8Encode } from "../shared/utf8";
+import { isLikelyIcon } from "../convert/nodes/icons";
 
 const VECTOR_TYPES = new Set([
   "VECTOR",
@@ -314,6 +315,13 @@ function collectExportTargets(
 
   if (isIconLikeComponent(node)) {
     if (w >= 1 && h >= 1) list.push({ node, format: "SVG" });
+    return;
+  }
+
+  // Match nodes/toJson canBeFlattened (FRAME/GROUP icon shells like "map-pin").
+  // Export the whole icon once — do not recurse into child vectors only.
+  if (isLikelyIcon(node) && !hasImageFill(node) && Math.max(w, h) >= 1) {
+    list.push({ node, format: "SVG" });
     return;
   }
 
@@ -720,55 +728,103 @@ export async function ensureFlattenedSvgAssets(
   let failed = 0;
   const seen = new Set<string>();
 
+  const cacheExport = async (
+    n: any,
+    scene: SceneNode,
+    prefer: ExportFormat,
+  ): Promise<boolean> => {
+    try {
+      const result = await exportNodeBytes(scene, prefer);
+      const actual: ExportFormat = result.format === "SVG" ? "SVG" : "PNG";
+      let bytes = result.bytes;
+      if (actual === "SVG") {
+        try {
+          bytes = utf8Encode(
+            fixSvgLinearGradients(utf8Decode(result.bytes), scene),
+          );
+        } catch (e) {
+          logError(`SVG gradient fix failed (${safeNodeRef(scene)})`, e);
+        }
+      }
+      const rel = assetRelPath(scene, actual);
+      postZipFile(rel, bytes);
+      upsertCachedAsset(scene.id, pathOnlyAsset(scene, actual, rel));
+      n.assetOnly = true;
+      n.exportAsAsset = true;
+      if (actual === "SVG") n.canBeFlattened = true;
+      else {
+        // PNG fallback still usable as <img>; keep flatten so generate wraps it.
+        n.canBeFlattened = true;
+      }
+      return true;
+    } catch (e) {
+      logError(
+        `ensure SVG/PNG asset failed (${safeNodeRef(scene)}, ${prefer})`,
+        e,
+      );
+      return false;
+    }
+  };
+
   const walk = async (n: any): Promise<void> => {
     if (!n || typeof n !== "object") return;
     const id = typeof n.id === "string" ? n.id : "";
-    if (id && nodeNeedsSvgAsset(n) && !seen.has(id)) {
+    const needsAsset = id && nodeNeedsSvgAsset(n);
+
+    if (needsAsset && !seen.has(id)) {
       seen.add(id);
-      if (!getCachedAsset(id)) {
+      const existing = getCachedAsset(id);
+      if (existing) {
+        n.assetOnly = true;
+        n.exportAsAsset = true;
+        if (existing.format === "SVG" || existing.format === "PNG") {
+          n.canBeFlattened = true;
+        }
+      } else {
         let scene: SceneNode | null = null;
         try {
           scene = (await figma.getNodeByIdAsync(id)) as SceneNode | null;
         } catch (e) {
           logError(`getNodeByIdAsync failed for ${id}`, e);
-          failed += 1;
         }
-        if (scene && "exportAsync" in scene && scene.visible !== false) {
+
+        let ok = false;
+        if (scene && "exportAsync" in scene) {
+          // Temporarily show for export if the live node was hidden.
+          let restoredVisible: boolean | null = null;
           try {
-            const result = await exportNodeBytes(scene, "SVG");
-            const actual: ExportFormat =
-              result.format === "SVG" ? "SVG" : "PNG";
-            let bytes = result.bytes;
-            if (actual === "SVG") {
+            if (scene.visible === false) {
+              restoredVisible = false;
+              scene.visible = true;
+            }
+            ok = await cacheExport(n, scene, "SVG");
+            if (!ok) ok = await cacheExport(n, scene, "PNG");
+          } finally {
+            if (restoredVisible !== null) {
               try {
-                bytes = utf8Encode(
-                  fixSvgLinearGradients(utf8Decode(result.bytes), scene),
-                );
-              } catch (e) {
-                logError(`SVG gradient fix failed (${safeNodeRef(scene)})`, e);
+                scene.visible = restoredVisible;
+              } catch {
+                /* node may have been removed */
               }
             }
-            const rel = assetRelPath(scene, actual);
-            postZipFile(rel, bytes);
-            upsertCachedAsset(id, pathOnlyAsset(scene, actual, rel));
-            n.assetOnly = true;
-            n.canBeFlattened = true;
-            n.exportAsAsset = true;
-            added += 1;
-          } catch (e) {
-            logError(`ensure SVG asset failed (${safeNodeRef(scene)})`, e);
-            failed += 1;
           }
         }
-      } else {
-        n.assetOnly = true;
-        if (getCachedAsset(id)?.format === "SVG") {
-          n.canBeFlattened = true;
+
+        if (!ok) {
+          failed += 1;
+          // Allow generate to fall through to children / CSS shapes.
+          n.canBeFlattened = false;
+          n.assetOnly = false;
+        } else {
+          added += 1;
         }
       }
     }
-    // Do not walk children of a node that will be emitted as a single SVG asset.
-    if (n.canBeFlattened || n.assetOnly) return;
+
+    // Only skip children when we successfully have a file for this node.
+    const cached = id ? getCachedAsset(id) : undefined;
+    if (cached?.path && (n.canBeFlattened || n.assetOnly)) return;
+
     if (Array.isArray(n.children)) {
       for (const c of n.children) await walk(c);
     }

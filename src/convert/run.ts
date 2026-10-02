@@ -15,7 +15,6 @@ import {
   postBackendMessage,
 } from "../messaging";
 import { PluginSettings } from "types";
-import { oldConvertNodesToAltNodes } from "./nodes/legacy";
 import { clearVariableCache, nodesToJSON } from "./nodes/toJson";
 import { prepareWebFontAvailability } from "../export/googleFonts";
 import {
@@ -56,21 +55,13 @@ export function getLastPreviewHtml(): string | null {
   return lastPreview?.html ?? null;
 }
 
-async function convertSelection(
-  settings: PluginSettings,
-  useOldPluginVersion2025: boolean,
-) {
+async function convertSelection(settings: PluginSettings) {
   const selection = figma.currentPage.selection;
   if (selection.length === 0) {
     return null;
   }
 
-  let convertedSelection: any;
-  if (useOldPluginVersion2025) {
-    convertedSelection = oldConvertNodesToAltNodes(selection, null);
-  } else {
-    convertedSelection = await nodesToJSON(selection, settings);
-  }
+  const convertedSelection = await nodesToJSON(selection, settings);
 
   if (!convertedSelection || convertedSelection.length === 0) {
     return null;
@@ -88,7 +79,6 @@ export const run = async (settings: PluginSettings) => {
   postConversionStart();
 
   try {
-    const { useOldPluginVersion2025 } = settings;
     const selection = figma.currentPage.selection;
 
     if (selection.length === 0) {
@@ -102,10 +92,7 @@ export const run = async (settings: PluginSettings) => {
     await prepareWebFontAvailability(selection);
     planAssetTargets(selection);
 
-    const converted = await convertSelection(
-      effectiveSettings,
-      useOldPluginVersion2025,
-    );
+    const converted = await convertSelection(effectiveSettings);
     if (!converted) {
       clearAssetCache();
       postEmptyMessage();
@@ -181,10 +168,7 @@ export const exportZipPackage = async (settings: PluginSettings) => {
     let html: string | null = null;
     let css = "";
     let stylesheetPath = ZIP_STYLESHEET_PATH;
-    const converted = await convertSelection(
-      effectiveSettings,
-      settings.useOldPluginVersion2025,
-    );
+    const converted = await convertSelection(effectiveSettings);
     if (converted) {
       postBackendMessage({
         type: "progress",

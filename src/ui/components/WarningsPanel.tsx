@@ -193,7 +193,7 @@ const WarningsPanel: React.FC<WarningsPanelProps> = ({ warnings }) => {
 const suggestFixForWarning = (warning: string): string => {
   const lower = warning.toLowerCase();
   if (lower.includes("missing svg asset")) {
-    return "The layer was treated as an SVG icon/illustration, but exportAsync failed or the node id could not be resolved. Try renaming/simplifying the layer, or ungroup nested masks so it can export as assets/*.svg.";
+    return "The layer was treated as an SVG icon. Export may have failed — the plugin now retries PNG and falls back to HTML children when possible. Flatten/ungroup nested masks if the icon is still missing from the ZIP.";
   }
   if (lower.includes("missing")) {
     return "Add the required properties to your component or select a parent element that includes all necessary children.";
